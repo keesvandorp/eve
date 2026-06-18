@@ -21,6 +21,7 @@ export interface DevelopmentServerOptions {
   readonly host?: string;
   readonly onBootProgress?: DevBootProgressReporter;
   readonly port?: number;
+  readonly reuseExisting?: boolean;
 }
 
 /**

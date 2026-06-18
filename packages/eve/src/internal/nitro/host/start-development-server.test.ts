@@ -40,6 +40,7 @@ const mocks = vi.hoisted(() => {
     createApplicationNitro: vi.fn(async () => nitro),
     createDevServer: vi.fn(() => devServer),
     devServer,
+    fetch: vi.fn(async () => new Response(null, { status: 200 })),
     files,
     listenerServer,
     mkdir: vi.fn(async () => undefined),
@@ -58,15 +59,32 @@ const mocks = vi.hoisted(() => {
     rm: vi.fn(async (path: string) => {
       files.delete(path);
     }),
+    rename: vi.fn(async (from: string, to: string) => {
+      const value = files.get(from);
+
+      if (value === undefined) {
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      }
+
+      files.set(to, value);
+      files.delete(from);
+    }),
     stat: vi.fn(async (path: string) => {
       if (!files.has(path)) {
         throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
       }
+
+      return { mtimeMs: Date.now() };
     }),
     startDevelopmentSandboxPrewarmInBackground: vi.fn(() => undefined),
     pruneLocalSandboxTemplatesInBackground: vi.fn(() => undefined),
     stopDevelopmentSandboxResources: vi.fn(async () => undefined),
     pruneDevelopmentRuntimeArtifactsSnapshotsInBackground: vi.fn(() => undefined),
+    resolveDiscoveryProject: vi.fn(async () => ({
+      agentRoot: "/tmp/eve-test/agent",
+      appRoot: "/tmp/eve-test",
+      layout: "nested" as const,
+    })),
     resolveNitroCompiledArtifactsSource: vi.fn(() => ({
       appRoot: "/tmp/eve-test/.eve/dev-runtime-test",
       kind: "disk" as const,
@@ -82,6 +100,7 @@ const mocks = vi.hoisted(() => {
 vi.mock("node:fs/promises", () => ({
   mkdir: mocks.mkdir,
   readFile: mocks.readFile,
+  rename: mocks.rename,
   rm: mocks.rm,
   stat: mocks.stat,
   writeFile: mocks.writeFile,
@@ -103,6 +122,10 @@ vi.mock("./dev-authored-source-watcher.js", () => ({
 
 vi.mock("./prepare-application-host.js", () => ({
   prepareApplicationHost: mocks.prepareApplicationHost,
+}));
+
+vi.mock("#discover/project.js", () => ({
+  resolveDiscoveryProject: mocks.resolveDiscoveryProject,
 }));
 
 vi.mock("#internal/nitro/routes/runtime-artifacts.js", () => ({
@@ -158,8 +181,21 @@ function createSocket(): Socket {
   return socket;
 }
 
-const developmentProcessIdPath = join("/tmp/eve-test", ".eve", "dev-process.pid");
-const developmentServerMetadataPath = join("/tmp/eve-test", ".eve", "dev-server.json");
+const developmentServerStatePath = join("/tmp/eve-test", ".eve", "dev-server.json");
+
+function readStateRecord(
+  path: string = developmentServerStatePath,
+): Record<string, unknown> | undefined {
+  const raw = mocks.files.get(path);
+  return raw === undefined ? undefined : (JSON.parse(raw) as Record<string, unknown>);
+}
+
+function seedStateRecord(
+  record: Record<string, unknown>,
+  path: string = developmentServerStatePath,
+): void {
+  mocks.files.set(path, `${JSON.stringify(record)}\n`);
+}
 
 async function startServer(): Promise<{
   close(): Promise<void>;
@@ -201,6 +237,8 @@ describe("normalizeDevelopmentServerClientUrl", () => {
 describe("startDevelopmentServer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.fetch.mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", mocks.fetch);
     delete process.env.WORKFLOW_LOCAL_BASE_URL;
     delete process.env.PORT;
     delete process.env.EVE_DEVELOPMENT_SANDBOX_RUN_ID;
@@ -226,6 +264,7 @@ describe("startDevelopmentServer", () => {
     delete process.env.PORT;
     delete process.env.EVE_DEVELOPMENT_SANDBOX_RUN_ID;
     mocks.files.clear();
+    vi.unstubAllGlobals();
   });
 
   it("pins local workflow queue callbacks to the active dev server URL", async () => {
@@ -264,7 +303,7 @@ describe("startDevelopmentServer", () => {
     expect(process.env.EVE_DEVELOPMENT_SANDBOX_RUN_ID).toBeUndefined();
   });
 
-  it("uses eve's default port when no port is requested", async () => {
+  it("uses Eve's default port when no port is requested", async () => {
     const { startDevelopmentServer } = await import("./start-development-server.js");
     Object.assign(mocks.nitro.options.devServer, {
       port: 3000,
@@ -328,31 +367,37 @@ describe("startDevelopmentServer", () => {
     await server.close();
   });
 
-  it("writes the active dev process id and removes it on close", async () => {
+  it("records the active dev process and url, and removes the state on close", async () => {
     const { startDevelopmentServer } = await import("./start-development-server.js");
 
     const server = await startDevelopmentServer("/tmp/eve-test");
 
-    expect(mocks.files.get(developmentProcessIdPath)).toBe(`${process.pid}\n`);
-    expect(JSON.parse(mocks.files.get(developmentServerMetadataPath) ?? "{}")).toMatchObject({
+    const record = readStateRecord();
+    expect(record).toMatchObject({
+      kind: "ready",
       pid: process.pid,
       url: "http://localhost:2000/",
     });
+    expect(typeof record?.ownerToken).toBe("string");
 
     await server.close();
 
-    expect(mocks.files.has(developmentProcessIdPath)).toBe(false);
-    expect(mocks.files.has(developmentServerMetadataPath)).toBe(false);
+    expect(mocks.files.has(developmentServerStatePath)).toBe(false);
   });
 
   it("refuses to start when the agent already has a running dev process", async () => {
     const { startDevelopmentServer } = await import("./start-development-server.js");
-    mocks.files.set(developmentProcessIdPath, `${process.pid}\n`);
+    seedStateRecord({
+      kind: "ready",
+      pid: process.pid,
+      ownerToken: "incumbent",
+      url: "http://localhost:2000/",
+    });
 
     await expect(startDevelopmentServer("/tmp/eve-test")).rejects.toThrow(
       [
         `A dev server is already running for this eve agent (pid ${process.pid}).`,
-        "To connect to the existing instance, run: pnpm exec eve dev http://localhost:PORT",
+        "To connect to the existing instance, run: pnpm exec eve dev http://localhost:2000/",
         `To stop it, run: ${
           process.platform === "win32" ? "taskkill /PID" : "kill"
         } ${process.pid}`,
@@ -361,41 +406,144 @@ describe("startDevelopmentServer", () => {
     expect(mocks.createApplicationNitro).not.toHaveBeenCalled();
   });
 
-  it("prints a copyable connect command with the detected package manager and server URL", async () => {
+  it("reuses the active server recorded for the same app root when requested", async () => {
     const { startDevelopmentServer } = await import("./start-development-server.js");
-    mocks.files.set(
-      join("/tmp/eve-test", "package.json"),
-      JSON.stringify({ packageManager: "npm@10.0.0" }),
-    );
-    mocks.files.set(developmentProcessIdPath, `${process.pid}\n`);
-    mocks.files.set(
-      developmentServerMetadataPath,
-      JSON.stringify({
-        pid: process.pid,
-        updatedAt: "2026-06-17T00:00:00.000Z",
-        url: "http://127.0.0.1:4321/",
-      }),
-    );
 
-    await expect(startDevelopmentServer("/tmp/eve-test")).rejects.toThrow(
-      [
-        `A dev server is already running for this eve agent (pid ${process.pid}).`,
-        "To connect to the existing instance, run: npm exec -- eve dev http://127.0.0.1:4321/",
-        `To stop it, run: ${
-          process.platform === "win32" ? "taskkill /PID" : "kill"
-        } ${process.pid}`,
-      ].join("\n"),
+    const owner = await startDevelopmentServer("/tmp/eve-test");
+    const ownerSandboxRunId = process.env.EVE_DEVELOPMENT_SANDBOX_RUN_ID;
+    // A real attaching TUI is a separate process and does not inherit the
+    // owner's internally installed listener port.
+    delete process.env.PORT;
+    const attached = await startDevelopmentServer("/tmp/eve-test", {
+      reuseExisting: true,
+    });
+
+    expect(attached.url).toBe(owner.url);
+    expect(mocks.createApplicationNitro).toHaveBeenCalledOnce();
+    expect(mocks.fetch).toHaveBeenCalledWith("http://localhost:2000/eve/v1/health", {
+      signal: expect.any(AbortSignal),
+    });
+    expect(process.env.EVE_DEVELOPMENT_SANDBOX_RUN_ID).toBe(ownerSandboxRunId);
+
+    await attached.close();
+
+    expect(mocks.devServer.close).not.toHaveBeenCalled();
+    expect(process.env.EVE_DEVELOPMENT_SANDBOX_RUN_ID).toBe(ownerSandboxRunId);
+    expect(readStateRecord()).toMatchObject({
+      kind: "ready",
+      pid: process.pid,
+      url: "http://localhost:2000/",
+    });
+
+    await owner.close();
+    expect(process.env.EVE_DEVELOPMENT_SANDBOX_RUN_ID).toBeUndefined();
+  });
+
+  it("reuses the active server when the requested environment port matches", async () => {
+    const { startDevelopmentServer } = await import("./start-development-server.js");
+    process.env.PORT = "2000";
+    seedStateRecord({
+      kind: "ready",
+      pid: process.pid,
+      ownerToken: "incumbent",
+      url: "http://localhost:2000/",
+    });
+
+    const attached = await startDevelopmentServer("/tmp/eve-test", {
+      reuseExisting: true,
+    });
+
+    expect(attached.url).toBe("http://localhost:2000/");
+    expect(mocks.createApplicationNitro).not.toHaveBeenCalled();
+    expect(mocks.fetch).toHaveBeenCalledOnce();
+
+    await attached.close();
+  });
+
+  it("rejects reuse when the requested environment port conflicts", async () => {
+    const { startDevelopmentServer } = await import("./start-development-server.js");
+    process.env.PORT = "2001";
+    seedStateRecord({
+      kind: "ready",
+      pid: process.pid,
+      ownerToken: "incumbent",
+      url: "http://localhost:2000/",
+    });
+
+    await expect(startDevelopmentServer("/tmp/eve-test", { reuseExisting: true })).rejects.toThrow(
+      `A dev server is already running for this eve agent (pid ${process.pid}).`,
+    );
+    expect(mocks.createApplicationNitro).not.toHaveBeenCalled();
+    expect(mocks.fetch).toHaveBeenCalledOnce();
+  });
+
+  it("reclaims a ready record when its process is alive but health fails", async () => {
+    const { startDevelopmentServer } = await import("./start-development-server.js");
+    mocks.fetch.mockResolvedValue(new Response(null, { status: 503 }));
+    seedStateRecord({
+      kind: "ready",
+      pid: process.pid,
+      ownerToken: "unhealthy",
+      url: "http://localhost:2000/",
+    });
+
+    const server = await startDevelopmentServer("/tmp/eve-test", { reuseExisting: true });
+
+    expect(mocks.fetch).toHaveBeenCalledWith("http://localhost:2000/eve/v1/health", {
+      signal: expect.any(AbortSignal),
+    });
+    expect(mocks.fetch).toHaveBeenCalledOnce();
+    expect(mocks.createApplicationNitro).toHaveBeenCalledOnce();
+    expect(readStateRecord()).toMatchObject({ kind: "ready", pid: process.pid });
+
+    await server.close();
+  });
+
+  it("refuses to reuse a recorded owner that has not yet published its url", async () => {
+    const { startDevelopmentServer } = await import("./start-development-server.js");
+    seedStateRecord({ kind: "starting", pid: process.pid, ownerToken: "incumbent" });
+
+    await expect(startDevelopmentServer("/tmp/eve-test", { reuseExisting: true })).rejects.toThrow(
+      `A dev server is already running for this eve agent (pid ${process.pid}).`,
     );
     expect(mocks.createApplicationNitro).not.toHaveBeenCalled();
   });
 
-  it("overwrites a stale dev process id", async () => {
+  it("does not reuse a server recorded under another app root", async () => {
     const { startDevelopmentServer } = await import("./start-development-server.js");
-    mocks.files.set(developmentProcessIdPath, "999999999\n");
+    const otherAppRoot = "/tmp/other-eve-test";
+
+    seedStateRecord(
+      { kind: "ready", pid: process.pid, ownerToken: "other", url: "http://127.0.0.1:2999/" },
+      join(otherAppRoot, ".eve", "dev-server.json"),
+    );
+
+    const server = await startDevelopmentServer("/tmp/eve-test", {
+      reuseExisting: true,
+    });
+
+    expect(server.url).toBe("http://localhost:2000/");
+    expect(mocks.createApplicationNitro).toHaveBeenCalledOnce();
+
+    await server.close();
+  });
+
+  it("overwrites a stale dev server record whose process is gone", async () => {
+    const { startDevelopmentServer } = await import("./start-development-server.js");
+    seedStateRecord({
+      kind: "ready",
+      pid: 999_999_999,
+      ownerToken: "stale",
+      url: "http://localhost:2000/",
+    });
 
     const server = await startDevelopmentServer("/tmp/eve-test");
 
-    expect(mocks.files.get(developmentProcessIdPath)).toBe(`${process.pid}\n`);
+    expect(readStateRecord()).toMatchObject({
+      kind: "ready",
+      pid: process.pid,
+      url: "http://localhost:2000/",
+    });
 
     await server.close();
   });

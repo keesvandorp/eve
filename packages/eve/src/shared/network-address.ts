@@ -39,6 +39,39 @@ function normalizeAddress(host: string): string {
 }
 
 /**
+ * Returns whether `hostname` names the current machine's loopback interface.
+ * Accepts the full IPv4 loopback block, IPv6 loopback, and the RFC 6761
+ * `localhost` namespace. Wildcard bind addresses such as `0.0.0.0` are not
+ * loopback connect targets.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
+  const normalized = normalizeAddress(hostname).toLowerCase();
+
+  if (normalized === "localhost" || normalized.endsWith(".localhost")) {
+    return true;
+  }
+
+  const family = isIP(normalized);
+  if (family === 4) {
+    return normalized.startsWith("127.");
+  }
+
+  return family === 6 && normalized === "::1";
+}
+
+/** Returns whether `urlText` is an HTTP(S) URL with a loopback hostname. */
+export function isLoopbackServerUrl(urlText: string): boolean {
+  try {
+    const url = new URL(urlText);
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") && isLoopbackHostname(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Whether `host` is an IP literal in a private, link-local, or otherwise
  * reserved range that an outbound framework request must not target — an SSRF
  * guard for caller-supplied URLs (covers RFC1918, CGNAT, link-local incl. cloud

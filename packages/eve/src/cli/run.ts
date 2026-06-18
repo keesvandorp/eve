@@ -489,7 +489,26 @@ function createCliProgram(logger: CliLogger, runtime: CliRuntimeOverrides): Comm
 
       loadDevelopmentEnvironmentFiles(appRoot);
 
-      const runInteractiveUi = async (serverUrl: string, report?: DevBootProgressReporter) => {
+      // Resolve early so the TUI title uses the same app root the host will own.
+      let localAppRoot: string | undefined;
+      if (remoteServerUrl === undefined) {
+        const { resolveDiscoveryProject } = await import("#discover/project.js");
+        try {
+          localAppRoot = (await resolveDiscoveryProject(appRoot)).appRoot;
+        } catch {
+          localAppRoot = appRoot;
+        }
+      }
+
+      const hasExplicitEndpoint =
+        options.host !== undefined ||
+        options.port !== undefined ||
+        (process.env.PORT?.trim() ?? "") !== "";
+
+      const runInteractiveUi = async (
+        serverUrl: string,
+        report?: DevBootProgressReporter,
+      ): Promise<void> => {
         const runDevelopmentTui = await devBootPhase(
           "loading interactive UI",
           async () => runtime.runDevelopmentTui ?? (await loadRunDevelopmentTui()),
@@ -555,10 +574,11 @@ function createCliProgram(logger: CliLogger, runtime: CliRuntimeOverrides): Comm
 
       try {
         const startHost = runtime.startHost ?? (await loadStartHost());
-        server = await startHost(appRoot, {
+        server = await startHost(localAppRoot ?? appRoot, {
           host: options.host,
           onBootProgress,
           port: options.port,
+          reuseExisting: mode === "tui" && !hasExplicitEndpoint,
         });
 
         // The terminal UI's header already shows the server URL, and startup
