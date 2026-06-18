@@ -3,9 +3,9 @@ import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { resolvePackageRoot } from "#internal/application/package.js";
-import { EVE_ROUTE_PREFIX } from "#protocol/routes.js";
+import { isEveServerHealthy } from "#shared/eve-server-health.js";
 
-import { joinRoutePrefix, normalizeOrigin } from "./routing.js";
+import { normalizeOrigin } from "./routing.js";
 
 export const EVE_BASE_URL_ENV = "EVE_BASE_URL";
 
@@ -77,21 +77,6 @@ export function normalizeDevServerRegistry(value: unknown): EveDevServerRegistry
     };
   } catch {
     return undefined;
-  }
-}
-
-async function isEveServerHealthy(origin: string): Promise<boolean> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1_000);
-  try {
-    const response = await fetch(joinRoutePrefix(origin, `${EVE_ROUTE_PREFIX}/health`), {
-      signal: controller.signal,
-    });
-    return response.ok;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
