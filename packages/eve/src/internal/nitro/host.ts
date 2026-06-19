@@ -4,5 +4,7 @@ export { startProductionServer } from "#internal/nitro/host/start-production-ser
 export type {
   DevelopmentServerHandle,
   DevelopmentServerOptions,
+  ExistingDevelopmentServer,
   ProductionServerHandle,
+  StartedDevelopmentServer,
 } from "#internal/nitro/host/types.js";

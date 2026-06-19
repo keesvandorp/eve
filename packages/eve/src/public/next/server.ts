@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { resolvePackageRoot } from "#internal/application/package.js";
 import { isEveServerHealthy } from "#shared/eve-server-health.js";
+import { isLoopbackHostname } from "#shared/network-address.js";
 
 const EVE_BASE_URL_ENV = "EVE_BASE_URL";
 const DEFAULT_SERVER_READY_TIMEOUT_MS = 180_000;
@@ -221,15 +222,6 @@ async function acquireEveDevServerLock(
 
 function createEveBinaryPath(): string {
   return join(resolvePackageRoot(), "bin", "eve.js");
-}
-
-function isLoopbackHostname(hostname: string): boolean {
-  return (
-    hostname === "localhost" ||
-    hostname === "::1" ||
-    hostname === "[::1]" ||
-    /^127(?:\.\d{1,3}){3}$/.test(hostname)
-  );
 }
 
 function parseLocalServerOrigin(urlText: string): string | undefined {

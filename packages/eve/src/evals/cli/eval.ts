@@ -3,7 +3,7 @@ import { basename, join } from "node:path";
 
 import { loadDevelopmentEnvironmentFiles } from "#cli/dev/environment.js";
 import { resolveApplicationRoot } from "#internal/application/paths.js";
-import { type DevelopmentServerHandle, startDevelopmentServer } from "#internal/nitro/host.js";
+import { type StartedDevelopmentServer, startDevelopmentServer } from "#internal/nitro/host.js";
 import { createEvalClient } from "#evals/cli/eval-client.js";
 import { discoverAndImportEvals, discoverEvalConfig } from "#evals/runner/discover.js";
 import { runEvals } from "#evals/runner/run-evals.js";
@@ -90,7 +90,7 @@ export async function runEvalCommand(
   }
 
   // Resolve target
-  let server: DevelopmentServerHandle | undefined;
+  let server: StartedDevelopmentServer | undefined;
   let target: EveEvalTargetHandle;
   let client: Awaited<ReturnType<typeof createEvalClient>>;
 

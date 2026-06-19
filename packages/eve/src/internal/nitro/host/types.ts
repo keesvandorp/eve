@@ -9,19 +9,29 @@ import type { DevBootProgressReporter } from "#internal/dev-boot-progress.js";
  */
 export type NitroBuildSurface = "all" | "app" | "flow";
 
-/**
- * Handle returned after starting one Nitro development server.
- */
-export interface DevelopmentServerHandle {
+/** A Nitro development server started and owned by the current process. */
+export interface StartedDevelopmentServer {
+  readonly kind: "started";
+  readonly appRoot: string;
   close(): Promise<void>;
-  url: string;
+  readonly url: string;
 }
 
+/** A live development server owned by another process. */
+export interface ExistingDevelopmentServer {
+  readonly kind: "existing";
+  readonly appRoot: string;
+  readonly url: string;
+}
+
+/** Result of resolving a development server for an app root. */
+export type DevelopmentServerHandle = StartedDevelopmentServer | ExistingDevelopmentServer;
+
 export interface DevelopmentServerOptions {
+  readonly existing?: "attach-if-unconfigured" | "reject";
   readonly host?: string;
   readonly onBootProgress?: DevBootProgressReporter;
   readonly port?: number;
-  readonly reuseExisting?: boolean;
 }
 
 /**

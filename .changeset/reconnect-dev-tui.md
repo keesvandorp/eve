@@ -2,4 +2,4 @@
 "eve": patch
 ---
 
-Running `eve dev` interactively now reattaches to the dev server already running for the same app root instead of refusing to start. Ownership is recorded in `.eve/dev-server.json`, claimed atomically under a lock, and reuse is gated on the owner process being alive, its health route responding, and a loopback URL. An explicit `--host`/`--port`/`PORT` opts out of reuse. A live server that cannot be reused still prints the package-manager-aware connect command.
+Running `eve dev` interactively now reconnects to the healthy loopback dev server already running for the same app root, with a fresh session for each attached terminal UI. Eve records ownership in versioned, process-safe state; a live process retains ownership even when its server is unavailable, while `--host`, `--port`, or `PORT` opts out of attachment and reports the existing process instead.

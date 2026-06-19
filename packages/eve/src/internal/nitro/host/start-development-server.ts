@@ -11,9 +11,14 @@ import { createNitroArtifactsConfig } from "#internal/nitro/host/artifacts-confi
 import type { AuthoredSourceWatcherHandle } from "#internal/nitro/host/dev-authored-source-watcher.js";
 import { prepareApplicationHost } from "#internal/nitro/host/prepare-application-host.js";
 import { resolveDiscoveryProject } from "#discover/project.js";
-import { type DevServerState, DevServerStateStore } from "#internal/nitro/host/dev-server-state.js";
+import {
+  type DevServerOwner,
+  type DevServerStateMutationError,
+  DevServerStateStore,
+} from "#internal/nitro/host/dev-server-state.js";
 import { toErrorMessage } from "#shared/errors.js";
-import { isLoopbackHostname, isLoopbackServerUrl } from "#shared/network-address.js";
+import { isEveServerHealthy } from "#shared/eve-server-health.js";
+import { isLoopbackServerUrl } from "#shared/network-address.js";
 import { resolveNitroCompiledArtifactsSource } from "#internal/nitro/routes/runtime-artifacts.js";
 import {
   pruneLocalSandboxTemplatesInBackground,
@@ -29,6 +34,7 @@ import {
 import type {
   DevelopmentServerHandle,
   DevelopmentServerOptions,
+  StartedDevelopmentServer,
 } from "#internal/nitro/host/types.js";
 import { loadDevelopmentEnvironmentFiles } from "#cli/dev/environment.js";
 import { pruneDevelopmentRuntimeArtifactsSnapshotsInBackground } from "#internal/nitro/dev-runtime-artifacts.js";
@@ -143,44 +149,37 @@ async function formatDevelopmentServerConnectCommand(
 
 async function createDevelopmentServerAlreadyRunningError(
   appRoot: string,
-  state: DevServerState,
+  owner: DevServerOwner,
 ): Promise<Error> {
-  const connectUrl = state.kind === "ready" ? state.url : DEVELOPMENT_SERVER_URL_PLACEHOLDER;
+  const connectUrl = owner.kind === "ready" ? owner.url : DEVELOPMENT_SERVER_URL_PLACEHOLDER;
   const connectCommand = await formatDevelopmentServerConnectCommand(appRoot, connectUrl);
   return new Error(
     [
-      `A dev server is already running for this eve agent (pid ${state.pid}).`,
+      `A dev server is already running for this eve agent (pid ${owner.pid}).`,
       `To connect to the existing instance, run: ${connectCommand}`,
-      `To stop it, run: ${formatKillCommand(state.pid)}`,
+      `To stop it, run: ${formatKillCommand(owner.pid)}`,
     ].join("\n"),
   );
 }
 
-function canReuseDevelopmentServer(input: {
-  readonly host: string | undefined;
-  readonly port: number | undefined;
-  readonly state: Extract<DevServerState, { readonly kind: "ready" }>;
-}): boolean {
-  if (!isLoopbackServerUrl(input.state.url)) {
-    return false;
+function createDevelopmentServerStateMutationError(
+  action: "mark dev server as closing" | "publish dev server state" | "release dev server state",
+  error: DevServerStateMutationError,
+): Error {
+  if (error.kind === "ownership-lost") {
+    const owner = error.pid === null ? "another process" : `pid ${error.pid}`;
+    return new Error(`Could not ${action} because ownership moved to ${owner}.`);
   }
 
-  if (
-    input.host !== undefined &&
-    input.host !== "0.0.0.0" &&
-    !IPV6_WILDCARD_LISTEN_HOSTNAMES.has(input.host) &&
-    !isLoopbackHostname(input.host)
-  ) {
-    return false;
+  if (error.kind === "invalid-transition") {
+    return new Error(
+      `Could not ${action} because the ${error.from} → ${error.to} transition is invalid.`,
+    );
   }
 
-  if (input.port === undefined || input.port === 0) {
-    return true;
-  }
-
-  const url = new URL(input.state.url);
-  const recordedPort = url.port === "" ? (url.protocol === "https:" ? 443 : 80) : Number(url.port);
-  return recordedPort === input.port;
+  return new Error(`Could not ${action}: ${toErrorMessage(error.cause)}`, {
+    cause: error.cause,
+  });
 }
 
 function resolveDevelopmentServerPorts(input: {
@@ -283,6 +282,72 @@ function guardDevelopmentServerWebSocketUpgrades(
   devServer.upgrade = guardedUpgrade;
 }
 
+async function closeDevelopmentServerResources(input: {
+  readonly authoredSourceWatcher: AuthoredSourceWatcherHandle | undefined;
+  readonly devServer: NitroDevelopmentServer | undefined;
+  readonly developmentSandboxRunId: string;
+  readonly nitro: Nitro | undefined;
+}): Promise<{ readonly errors: readonly unknown[]; readonly listenerClosed: boolean }> {
+  const errors: unknown[] = [];
+  const attempt = async (operation: () => Promise<void>): Promise<boolean> => {
+    try {
+      await operation();
+      return true;
+    } catch (error) {
+      errors.push(error);
+      return false;
+    }
+  };
+
+  const authoredSourceWatcher = input.authoredSourceWatcher;
+  if (authoredSourceWatcher !== undefined) {
+    await attempt(() => authoredSourceWatcher.close());
+  }
+  const devServer = input.devServer;
+  const listenerClosed = devServer === undefined ? true : await attempt(() => devServer.close());
+  const nitro = input.nitro;
+  if (nitro !== undefined) {
+    await attempt(() => nitro.close());
+  }
+  await attempt(() =>
+    stopDevelopmentSandboxResources({
+      backendNames: getInitializedDevelopmentSandboxBackendNames(input.developmentSandboxRunId),
+      devRunId: input.developmentSandboxRunId,
+      log: (message) => console.warn(`[eve:dev] ${message}`),
+    }),
+  );
+
+  return { errors, listenerClosed };
+}
+
+function createDevelopmentServerCleanupError(errors: readonly unknown[]): Error | undefined {
+  if (errors.length === 0) {
+    return undefined;
+  }
+
+  if (errors.length === 1) {
+    const error = errors[0];
+    return error instanceof Error
+      ? error
+      : new Error(`Failed to close the development server: ${toErrorMessage(error)}`, {
+          cause: error,
+        });
+  }
+
+  return new AggregateError(errors, "Multiple development-server resources failed to close.");
+}
+
+function createDevelopmentServerStartupCleanupError(
+  startupError: unknown,
+  cleanupErrors: readonly unknown[],
+): AggregateError {
+  return new AggregateError(
+    [startupError, ...cleanupErrors],
+    `${toErrorMessage(startupError)} Cleanup also failed.`,
+    { cause: startupError },
+  );
+}
+
 async function listenForDevelopmentServer(input: {
   readonly devServer: NitroDevelopmentServer;
   readonly host?: string;
@@ -336,6 +401,14 @@ async function listenForDevelopmentServer(input: {
  * `{ scheduleId, sessionIds }` so callers can subscribe to the existing
  * per-session stream route.
  */
+export function startDevelopmentServer(
+  rootDir: string,
+  options?: DevelopmentServerOptions & { existing?: "reject" },
+): Promise<StartedDevelopmentServer>;
+export function startDevelopmentServer(
+  rootDir: string,
+  options?: DevelopmentServerOptions,
+): Promise<DevelopmentServerHandle>;
 export async function startDevelopmentServer(
   rootDir: string,
   options: DevelopmentServerOptions = {},
@@ -348,7 +421,10 @@ export async function startDevelopmentServer(
   const project = await resolveDiscoveryProject(rootDir);
   loadDevelopmentEnvironmentFiles(project.appRoot);
 
-  const requestedPort = options.port ?? readEnvironmentPort();
+  const environmentPort = readEnvironmentPort();
+  const requestedPort = options.port ?? environmentPort;
+  const hasExplicitEndpoint =
+    options.host !== undefined || options.port !== undefined || environmentPort !== undefined;
   const stateStore = new DevServerStateStore(project.appRoot);
   const claim = await stateStore.claim(process.pid);
 
@@ -360,21 +436,21 @@ export async function startDevelopmentServer(
   }
 
   if (claim.value.kind === "occupied") {
-    const occupant = claim.value.state;
-    // Interactive callers reattach to a ready owner instead of failing. A
-    // non-local URL could only be a forged record, so reuse is gated on
-    // loopback to keep the client from being pointed off-box.
+    const owner = claim.value.owner;
     if (
-      options.reuseExisting === true &&
-      occupant.kind === "ready" &&
-      canReuseDevelopmentServer({ host: options.host, port: requestedPort, state: occupant })
+      options.existing === "attach-if-unconfigured" &&
+      !hasExplicitEndpoint &&
+      owner.kind === "ready" &&
+      isLoopbackServerUrl(owner.url) &&
+      (await isEveServerHealthy(owner.url))
     ) {
       return {
-        close: async () => undefined,
-        url: occupant.url,
+        kind: "existing",
+        appRoot: project.appRoot,
+        url: owner.url,
       };
     }
-    throw await createDevelopmentServerAlreadyRunningError(project.appRoot, occupant);
+    throw await createDevelopmentServerAlreadyRunningError(project.appRoot, owner);
   }
 
   const ownerToken = claim.value.ownerToken;
@@ -390,7 +466,7 @@ export async function startDevelopmentServer(
   try {
     const preparedHost = await devBootPhase(
       "compiling agent",
-      () => prepareApplicationHost(rootDir, { dev: true }),
+      () => prepareApplicationHost(project.appRoot, { dev: true }),
       options.onBootProgress,
     );
     pruneDevelopmentRuntimeArtifactsSnapshotsInBackground(preparedHost.appRoot);
@@ -434,7 +510,6 @@ export async function startDevelopmentServer(
     }
 
     const serverUrl = normalizeDevelopmentServerClientUrl(server.url);
-    await stateStore.publish({ ownerToken, url: serverUrl });
     restoreWorkflowLocalQueueEnvironment = installWorkflowLocalQueueEnvironment(serverUrl);
     await devBootPhase(
       "building dev bundle",
@@ -450,10 +525,20 @@ export async function startDevelopmentServer(
       async () => {
         const { startAuthoredSourceWatcher } =
           await import("#internal/nitro/host/dev-authored-source-watcher.js");
-        return startAuthoredSourceWatcher({ nitro: activeNitro, preparedHost });
+        return startAuthoredSourceWatcher({
+          nitro: activeNitro,
+          preparedHost,
+        });
       },
       options.onBootProgress,
     );
+    const publication = await stateStore.publish({ ownerToken, url: serverUrl });
+    if (!publication.ok) {
+      throw createDevelopmentServerStateMutationError(
+        "publish dev server state",
+        publication.error,
+      );
+    }
     const restoreWorkflowLocalQueueEnvironmentOnClose = restoreWorkflowLocalQueueEnvironment;
     if (restoreWorkflowLocalQueueEnvironmentOnClose === undefined) {
       throw new Error("Workflow local queue environment was not initialized.");
@@ -462,39 +547,102 @@ export async function startDevelopmentServer(
     const authoredSourceWatcherOnClose = authoredSourceWatcher;
     const devServerOnClose = devServer;
     const nitroOnClose = activeNitro;
+    let cleanupResult:
+      | { readonly errors: readonly unknown[]; readonly listenerClosed: boolean }
+      | undefined;
+    let closePromise: Promise<void> | undefined;
     return {
+      kind: "started",
+      appRoot: project.appRoot,
       async close() {
+        if (closePromise !== undefined) {
+          await closePromise;
+          return;
+        }
+
+        let releaseFailed = false;
+        const currentClose = (async () => {
+          if (cleanupResult === undefined) {
+            const closing = await stateStore.markClosing(ownerToken);
+            if (!closing.ok && closing.error.kind !== "ownership-lost") {
+              throw createDevelopmentServerStateMutationError(
+                "mark dev server as closing",
+                closing.error,
+              );
+            }
+
+            cleanupResult = await closeDevelopmentServerResources({
+              authoredSourceWatcher: authoredSourceWatcherOnClose,
+              devServer: devServerOnClose,
+              developmentSandboxRunId,
+              nitro: nitroOnClose,
+            });
+            try {
+              clearInitializedDevelopmentSandboxBackendNames(developmentSandboxRunId);
+            } finally {
+              restoreWorkflowLocalQueueEnvironmentOnClose();
+              restoreDevelopmentSandboxRunId(previousDevelopmentSandboxRunId);
+            }
+          }
+
+          const cleanupErrors = [...cleanupResult.errors];
+          if (cleanupResult.listenerClosed) {
+            try {
+              await releaseDevelopmentProcess();
+            } catch (cause) {
+              releaseFailed = true;
+              cleanupErrors.push(
+                createDevelopmentServerStateMutationError("release dev server state", {
+                  kind: "io",
+                  cause,
+                }),
+              );
+            }
+          }
+
+          const cleanupError = createDevelopmentServerCleanupError(cleanupErrors);
+          if (cleanupError !== undefined) {
+            throw cleanupError;
+          }
+        })();
+        closePromise = currentClose;
         try {
-          await authoredSourceWatcherOnClose.close();
-          await devServerOnClose.close();
-          await nitroOnClose.close();
-          await stopDevelopmentSandboxResources({
-            backendNames: getInitializedDevelopmentSandboxBackendNames(developmentSandboxRunId),
-            devRunId: developmentSandboxRunId,
-            log: (message) => console.warn(`[eve:dev] ${message}`),
-          });
-        } finally {
-          clearInitializedDevelopmentSandboxBackendNames(developmentSandboxRunId);
-          await releaseDevelopmentProcess();
-          restoreWorkflowLocalQueueEnvironmentOnClose();
-          restoreDevelopmentSandboxRunId(previousDevelopmentSandboxRunId);
+          await currentClose;
+        } catch (error) {
+          if ((cleanupResult === undefined || releaseFailed) && closePromise === currentClose) {
+            closePromise = undefined;
+          }
+          throw error;
         }
       },
       url: serverUrl,
     };
   } catch (error) {
-    await authoredSourceWatcher?.close().catch(() => {});
+    const cleanup = await closeDevelopmentServerResources({
+      authoredSourceWatcher,
+      devServer,
+      developmentSandboxRunId,
+      nitro,
+    });
+    const cleanupErrors = [...cleanup.errors];
     restoreWorkflowLocalQueueEnvironment?.();
-    await devServer?.close().catch(() => {});
-    await nitro?.close().catch(() => {});
-    await stopDevelopmentSandboxResources({
-      backendNames: getInitializedDevelopmentSandboxBackendNames(developmentSandboxRunId),
-      devRunId: developmentSandboxRunId,
-      log: (message) => console.warn(`[eve:dev] ${message}`),
-    }).catch(() => {});
     clearInitializedDevelopmentSandboxBackendNames(developmentSandboxRunId);
-    await releaseDevelopmentProcess().catch(() => {});
+    if (cleanup.listenerClosed) {
+      try {
+        await releaseDevelopmentProcess();
+      } catch (cause) {
+        cleanupErrors.push(
+          createDevelopmentServerStateMutationError("release dev server state", {
+            kind: "io",
+            cause,
+          }),
+        );
+      }
+    }
     restoreDevelopmentSandboxRunId(previousDevelopmentSandboxRunId);
+    if (cleanupErrors.length > 0) {
+      throw createDevelopmentServerStartupCleanupError(error, cleanupErrors);
+    }
     throw error;
   }
 }

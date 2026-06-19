@@ -1,24 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { z } from "#compiled/zod/index.js";
-import { isEveServerHealthy } from "#shared/eve-server-health.js";
 import { err, ok, type Result } from "#shared/result.js";
 
-// One record per project root, under `.eve/`. A live starting owner, or a live
-// ready owner whose health route responds, blocks another claim. A TUI reads
-// `url` from a healthy `ready` record to reattach without scanning ports.
-const STATE_FILE_NAME = "dev-server.json";
-// A sibling lock directory (atomic `mkdir`) serializes the read-decide-write
-// critical section so two processes cannot both win the claim. State updates
-// land via atomic rename, so readers never see a torn file.
-const LOCK_DIR_NAME = "dev-server.lock";
+const STATE_FILE_NAME = "dev-server-state.v1.json";
+const LOCK_FILE_NAME = "dev-server-state.lock.sqlite";
+const LEGACY_PROCESS_ID_FILE_NAME = "dev-process.pid";
+const LEGACY_SERVER_FILE_NAME = "dev-server.json";
 const LOCK_POLL_MS = 50;
 const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
-// A lock older than this is assumed abandoned by a crashed claimer. Claims are
-// near-instant, so the window is generous relative to the work it guards.
-const STALE_LOCK_MS = 60_000;
 
 const processIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const ownerTokenSchema = z.string().min(1);
@@ -41,39 +34,47 @@ const readyDevServerStateSchema = z
     url: httpServerUrlSchema,
   })
   .strict();
+const closingDevServerStateSchema = z
+  .object({
+    kind: z.literal("closing"),
+    ownerToken: ownerTokenSchema,
+    pid: processIdSchema,
+  })
+  .strict();
 const devServerStateSchema = z.discriminatedUnion("kind", [
   startingDevServerStateSchema,
   readyDevServerStateSchema,
+  closingDevServerStateSchema,
 ]);
+const legacyDevServerMetadataSchema = z.object({
+  pid: processIdSchema,
+  url: httpServerUrlSchema,
+});
 
-/**
- * The recorded owner of the dev server for a project root.
- *
- * `ownerToken` is minted once by the store and required to publish or release
- * the claim. A `starting` owner has bound no URL yet; only a `ready` owner can
- * be reattached to.
- */
+/** Persisted ownership state for one app root. */
 export type DevServerState = Readonly<z.infer<typeof devServerStateSchema>>;
+
+/** A live process that currently owns the app root. */
+export type DevServerOwner =
+  | { readonly kind: "starting"; readonly pid: number }
+  | { readonly kind: "ready"; readonly pid: number; readonly url: string }
+  | { readonly kind: "closing"; readonly pid: number };
 
 /** The result of atomically claiming a project root. */
 export type DevServerClaim =
   | { readonly kind: "claimed"; readonly ownerToken: string }
-  | { readonly kind: "occupied"; readonly state: DevServerState };
+  | { readonly kind: "occupied"; readonly owner: DevServerOwner };
 
 /** Why {@link DevServerStateStore.claim} could not inspect or persist state. */
 export type DevServerClaimError = { readonly kind: "io"; readonly cause: unknown };
 
-/** Why {@link DevServerStateStore.publish} could not publish the claimed URL. */
-export type DevServerPublishError =
+/** Why an owned dev-server state transition could not be persisted. */
+export type DevServerStateMutationError =
   | { readonly kind: "io"; readonly cause: unknown }
+  | { readonly kind: "invalid-transition"; readonly from: "closing"; readonly to: "ready" }
   | { readonly kind: "ownership-lost"; readonly pid: number | null };
 
-/**
- * Returns whether a process with `pid` is currently running. This only proves
- * process liveness; ready dev-server records also require a successful health
- * request through {@link isDevelopmentServerStateActive}. `EPERM` counts as
- * alive because the process exists but belongs to another user.
- */
+/** Returns whether the operating system still has a process with `pid`. */
 export function isProcessRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -84,75 +85,67 @@ export function isProcessRunning(pid: number): boolean {
 }
 
 /**
- * Returns whether a recorded owner still represents an active dev server.
- * Starting owners have no URL yet, so process liveness protects their claim.
- * Ready owners must keep both their process and Eve health route alive.
- */
-export async function isDevelopmentServerStateActive(state: DevServerState): Promise<boolean> {
-  if (!isProcessRunning(state.pid)) {
-    return false;
-  }
-
-  return state.kind === "starting" ? true : await isEveServerHealthy(state.url);
-}
-
-/**
- * Owns the `.eve/dev-server.json` record for one project root: its schema,
- * validation, atomic persistence, and the cross-process locking that keeps
- * ownership claims race-free. The host orchestrator drives the lifecycle:
- * `claim` chooses between an active owner and a fresh claim, `publish` records
- * the claimed URL, and `release` relinquishes ownership.
+ * Owns the versioned dev-server record for one app root. SQLite provides the
+ * cross-process mutex; the JSON record remains the inspectable source of
+ * ownership and attachment data.
  */
 export class DevServerStateStore {
   readonly #stateDir: string;
   readonly #statePath: string;
-  readonly #lockDir: string;
+  readonly #lockPath: string;
+  readonly #legacyProcessIdPath: string;
+  readonly #legacyServerPath: string;
 
   constructor(appRoot: string) {
     this.#stateDir = join(appRoot, ".eve");
     this.#statePath = join(this.#stateDir, STATE_FILE_NAME);
-    this.#lockDir = join(this.#stateDir, LOCK_DIR_NAME);
+    this.#lockPath = join(this.#stateDir, LOCK_FILE_NAME);
+    this.#legacyProcessIdPath = join(this.#stateDir, LEGACY_PROCESS_ID_FILE_NAME);
+    this.#legacyServerPath = join(this.#stateDir, LEGACY_SERVER_FILE_NAME);
   }
 
-  /**
-   * Atomically returns the active owner or records a fresh starting claim.
-   * Missing, malformed, dead, and unhealthy records are replaced.
-   * If claiming fails, an active atomically written record is still returned.
-   */
+  /** Atomically returns the live owner or records a fresh starting claim. */
   async claim(pid: number): Promise<Result<DevServerClaim, DevServerClaimError>> {
     try {
       return await this.#withLock(async () => {
         const loaded = await this.#load();
 
-        if (loaded.kind === "ok") {
-          const isServerActive = await isDevelopmentServerStateActive(loaded.state);
-          if (isServerActive) {
-            return ok({ kind: "occupied", state: loaded.state });
-          }
+        if (loaded.kind === "corrupt") {
+          throw this.#createCorruptStateError(loaded.cause);
         }
 
+        if (loaded.kind === "ok" && isProcessRunning(loaded.state.pid)) {
+          return ok({ kind: "occupied", owner: stateToOwner(loaded.state) });
+        }
+
+        const legacyOwner = await this.#loadLegacyOwner();
+        if (legacyOwner !== undefined) {
+          return ok({ kind: "occupied", owner: legacyOwner });
+        }
+
+        await this.#removeLegacyState();
         const ownerToken = randomUUID();
-        await this.#writeAtomic({ kind: "starting", ownerToken, pid });
+        await this.#writeClaimRecords({ kind: "starting", ownerToken, pid });
         return ok({ kind: "claimed", ownerToken });
       });
     } catch (cause) {
-      const loaded = await this.#load();
-      if (loaded.kind === "ok" && (await isDevelopmentServerStateActive(loaded.state))) {
-        return ok({ kind: "occupied", state: loaded.state });
-      }
-
-      return err({ kind: "io", cause });
+      const owner = await this.#loadOwnerWithoutLock().catch(() => undefined);
+      return owner === undefined ? err({ kind: "io", cause }) : ok({ kind: "occupied", owner });
     }
   }
 
-  /** Publishes the URL for a claim that is still owned by `ownerToken`. */
+  /** Publishes the URL for a claim that still owns the app root. */
   async publish(input: {
     readonly ownerToken: string;
     readonly url: string;
-  }): Promise<Result<void, DevServerPublishError>> {
+  }): Promise<Result<void, DevServerStateMutationError>> {
     try {
       return await this.#withLock(async () => {
         const loaded = await this.#load();
+
+        if (loaded.kind === "corrupt") {
+          throw this.#createCorruptStateError(loaded.cause);
+        }
 
         if (loaded.kind !== "ok" || loaded.state.ownerToken !== input.ownerToken) {
           return err({
@@ -161,11 +154,58 @@ export class DevServerStateStore {
           });
         }
 
+        if (loaded.state.kind === "closing") {
+          return err({ kind: "invalid-transition", from: "closing", to: "ready" });
+        }
+
+        await this.#writeLegacyMetadata(loaded.state.pid, input.url);
+        try {
+          await this.#writeAtomic({
+            kind: "ready",
+            ownerToken: input.ownerToken,
+            pid: loaded.state.pid,
+            url: input.url,
+          });
+        } catch (cause) {
+          try {
+            await this.#removeLegacyMetadataForProcess(loaded.state.pid);
+          } catch (rollbackCause) {
+            throw new AggregateError(
+              [cause, rollbackCause],
+              "Failed to publish dev-server state and remove compatibility metadata.",
+            );
+          }
+          throw cause;
+        }
+        return ok(undefined);
+      });
+    } catch (cause) {
+      return err({ kind: "io", cause });
+    }
+  }
+
+  /** Makes an owned server non-attachable before its resources begin closing. */
+  async markClosing(ownerToken: string): Promise<Result<void, DevServerStateMutationError>> {
+    try {
+      return await this.#withLock(async () => {
+        const loaded = await this.#load();
+
+        if (loaded.kind === "corrupt") {
+          throw this.#createCorruptStateError(loaded.cause);
+        }
+
+        if (loaded.kind !== "ok" || loaded.state.ownerToken !== ownerToken) {
+          return err({
+            kind: "ownership-lost",
+            pid: loaded.kind === "ok" ? loaded.state.pid : null,
+          });
+        }
+
+        await this.#removeLegacyMetadataForProcess(loaded.state.pid);
         await this.#writeAtomic({
-          kind: "ready",
-          ownerToken: input.ownerToken,
+          kind: "closing",
+          ownerToken,
           pid: loaded.state.pid,
-          url: input.url,
         });
         return ok(undefined);
       });
@@ -174,29 +214,36 @@ export class DevServerStateStore {
     }
   }
 
-  /**
-   * Removes the record, but only if it is still owned by `token`. A mismatched
-   * or already-replaced record is left untouched so a process never deletes a
-   * successor's claim. Best-effort: a failed release leaves a record that the
-   * next claim reclaims once this pid exits.
-   */
-  async release(token: string): Promise<void> {
-    try {
-      await this.#withLock(async () => {
-        const loaded = await this.#load();
+  /** Removes the record only when `ownerToken` still owns it. */
+  async release(ownerToken: string): Promise<void> {
+    await this.#withLock(async () => {
+      const loaded = await this.#load();
 
-        if (loaded.kind === "ok" && loaded.state.ownerToken === token) {
-          await rm(this.#statePath, { force: true });
-        }
-      });
-    } catch {
-      // Intentionally swallowed; see method doc.
+      if (loaded.kind === "corrupt") {
+        throw this.#createCorruptStateError(loaded.cause);
+      }
+
+      if (loaded.kind === "ok" && loaded.state.ownerToken === ownerToken) {
+        // Remove compatibility files while the old PID marker still blocks
+        // legacy Eve processes, then relinquish the versioned claim.
+        await this.#removeLegacyStateForProcess(loaded.state.pid);
+        await rm(this.#statePath, { force: true });
+      }
+    });
+  }
+
+  async #loadOwnerWithoutLock(): Promise<DevServerOwner | undefined> {
+    const loaded = await this.#load();
+    if (loaded.kind === "ok" && isProcessRunning(loaded.state.pid)) {
+      return stateToOwner(loaded.state);
     }
+
+    return await this.#loadLegacyOwner();
   }
 
   async #load(): Promise<
     | { readonly kind: "absent" }
-    | { readonly kind: "corrupt" }
+    | { readonly kind: "corrupt"; readonly cause: unknown }
     | { readonly kind: "ok"; readonly state: DevServerState }
   > {
     let raw: string;
@@ -204,75 +251,149 @@ export class DevServerStateStore {
     try {
       raw = await readFile(this.#statePath, "utf8");
     } catch (error) {
-      return isErrnoException(error, "ENOENT") ? { kind: "absent" } : { kind: "corrupt" };
+      if (isErrnoException(error, "ENOENT")) {
+        return { kind: "absent" };
+      }
+      throw error;
     }
 
     const state = parseDevServerState(raw);
-    return state.ok ? { kind: "ok", state: state.value } : { kind: "corrupt" };
+    return state.ok ? { kind: "ok", state: state.value } : { kind: "corrupt", cause: state.error };
+  }
+
+  async #loadLegacyOwner(): Promise<DevServerOwner | undefined> {
+    const [processIdRaw, metadataRaw] = await Promise.all([
+      readOptionalFile(this.#legacyProcessIdPath),
+      readOptionalFile(this.#legacyServerPath),
+    ]);
+    const processId = processIdRaw === undefined ? undefined : parseLegacyProcessId(processIdRaw);
+    if (processId === undefined || !isProcessRunning(processId)) {
+      return undefined;
+    }
+
+    const metadata = metadataRaw === undefined ? undefined : parseLegacyMetadata(metadataRaw);
+    return metadata?.pid === processId
+      ? { kind: "ready", pid: processId, url: metadata.url }
+      : { kind: "starting", pid: processId };
+  }
+
+  #createCorruptStateError(cause: unknown): Error {
+    return new Error(`Dev-server state at "${this.#statePath}" is malformed.`, { cause });
+  }
+
+  async #removeLegacyState(): Promise<void> {
+    await Promise.all([
+      rm(this.#legacyProcessIdPath, { force: true }),
+      rm(this.#legacyServerPath, { force: true }),
+    ]);
+  }
+
+  async #removeLegacyStateForProcess(pid: number): Promise<void> {
+    await this.#removeLegacyMetadataForProcess(pid);
+
+    const processIdRaw = await readOptionalFile(this.#legacyProcessIdPath);
+    const processId = processIdRaw === undefined ? undefined : parseLegacyProcessId(processIdRaw);
+    if (processId === pid) {
+      await rm(this.#legacyProcessIdPath, { force: true });
+    }
+  }
+
+  async #removeLegacyMetadataForProcess(pid: number): Promise<void> {
+    const metadataRaw = await readOptionalFile(this.#legacyServerPath);
+    const metadata = metadataRaw === undefined ? undefined : parseLegacyMetadata(metadataRaw);
+    if (metadata?.pid === pid) {
+      await rm(this.#legacyServerPath, { force: true });
+    }
+  }
+
+  async #writeClaimRecords(
+    state: Extract<DevServerState, { readonly kind: "starting" }>,
+  ): Promise<void> {
+    let wroteLegacyProcessId = false;
+
+    try {
+      await this.#writeTextAtomic(this.#legacyProcessIdPath, `${state.pid}\n`);
+      wroteLegacyProcessId = true;
+      await this.#writeAtomic(state);
+    } catch (error) {
+      if (wroteLegacyProcessId) {
+        await this.#removeLegacyStateForProcess(state.pid).catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  async #writeLegacyMetadata(pid: number, url: string): Promise<void> {
+    await this.#writeTextAtomic(
+      this.#legacyServerPath,
+      `${JSON.stringify({ pid, updatedAt: new Date().toISOString(), url }, null, 2)}\n`,
+    );
   }
 
   async #writeAtomic(state: DevServerState): Promise<void> {
-    await mkdir(this.#stateDir, { recursive: true });
-    const temporaryPath = `${this.#statePath}.${process.pid}.tmp`;
     const validatedState = devServerStateSchema.parse(state);
-    await writeFile(temporaryPath, `${JSON.stringify(validatedState)}\n`, "utf8");
-    await rename(temporaryPath, this.#statePath);
+    await this.#writeTextAtomic(this.#statePath, `${JSON.stringify(validatedState)}\n`);
+  }
+
+  async #writeTextAtomic(path: string, value: string): Promise<void> {
+    await mkdir(this.#stateDir, { recursive: true });
+    const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+
+    try {
+      await writeFile(temporaryPath, value, "utf8");
+      await rename(temporaryPath, path);
+    } finally {
+      await rm(temporaryPath, { force: true }).catch(() => {});
+    }
   }
 
   async #withLock<T>(callback: () => Promise<T>): Promise<T> {
-    await this.#acquireLock();
+    await mkdir(this.#stateDir, { recursive: true });
+    const database = await acquireSqliteLock(this.#lockPath);
 
     try {
       return await callback();
     } finally {
-      await rm(this.#lockDir, { force: true, recursive: true }).catch(() => {});
-    }
-  }
-
-  async #acquireLock(): Promise<void> {
-    const startedAt = Date.now();
-
-    for (;;) {
-      await mkdir(this.#stateDir, { recursive: true });
-
       try {
-        await mkdir(this.#lockDir);
-        return;
-      } catch (error) {
-        if (!isErrnoException(error, "EEXIST")) {
-          throw error;
-        }
-
-        await this.#waitForLock(startedAt);
+        database.exec("ROLLBACK");
+      } finally {
+        database.close();
       }
     }
   }
+}
 
-  async #waitForLock(startedAt: number): Promise<void> {
-    const info = await stat(this.#lockDir).catch((error: unknown) => {
-      if (isErrnoException(error, "ENOENT")) {
-        return null;
+async function acquireSqliteLock(lockPath: string): Promise<DatabaseSync> {
+  const startedAt = Date.now();
+
+  for (;;) {
+    const database = new DatabaseSync(lockPath, { timeout: 0 });
+
+    try {
+      database.exec("BEGIN IMMEDIATE");
+      return database;
+    } catch (error) {
+      database.close();
+
+      if (!isSqliteBusyError(error)) {
+        throw error;
       }
-      throw error;
-    });
 
-    if (info === null) {
-      return;
+      if (Date.now() - startedAt > LOCK_ACQUIRE_TIMEOUT_MS) {
+        throw new Error(`Timed out acquiring dev-server state lock at "${lockPath}".`, {
+          cause: error,
+        });
+      }
+
+      await delay(LOCK_POLL_MS);
     }
-
-    const now = Date.now();
-
-    if (now - info.mtimeMs > STALE_LOCK_MS) {
-      await rm(this.#lockDir, { force: true, recursive: true }).catch(() => {});
-      return;
-    }
-
-    if (now - startedAt > LOCK_ACQUIRE_TIMEOUT_MS) {
-      throw new Error(`Timed out acquiring dev-server state lock at "${this.#lockDir}".`);
-    }
-
-    await delay(LOCK_POLL_MS);
   }
+}
+
+function stateToOwner(state: DevServerState): DevServerOwner {
+  return state.kind === "ready"
+    ? { kind: "ready", pid: state.pid, url: state.url }
+    : { kind: state.kind, pid: state.pid };
 }
 
 function parseDevServerState(raw: string): Result<DevServerState, unknown> {
@@ -288,6 +409,42 @@ function parseDevServerState(raw: string): Result<DevServerState, unknown> {
   return parsed.success ? ok(parsed.data) : err(parsed.error);
 }
 
+function parseLegacyMetadata(
+  raw: string,
+): Readonly<z.infer<typeof legacyDevServerMetadataSchema>> | undefined {
+  let value: unknown;
+
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+
+  const parsed = legacyDevServerMetadataSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function parseLegacyProcessId(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined;
+  }
+
+  const parsed = Number(trimmed);
+  return processIdSchema.safeParse(parsed).success ? parsed : undefined;
+}
+
+async function readOptionalFile(path: string): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    if (isErrnoException(error, "ENOENT")) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 function isHttpServerUrl(value: string): boolean {
   try {
     const url = new URL(value);
@@ -295,6 +452,16 @@ function isHttpServerUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "ERR_SQLITE_ERROR" &&
+    "errcode" in error &&
+    error.errcode === 5
+  );
 }
 
 function isErrnoException(error: unknown, code: string): boolean {
