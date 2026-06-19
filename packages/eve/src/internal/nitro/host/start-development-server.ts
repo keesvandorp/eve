@@ -18,7 +18,7 @@ import {
 } from "#internal/nitro/host/dev-server-state.js";
 import { toErrorMessage } from "#shared/errors.js";
 import { isEveServerHealthy } from "#shared/eve-server-health.js";
-import { isLoopbackServerUrl } from "#shared/network-address.js";
+import { isLocalDevelopmentServerUrl } from "#services/dev-client/local-host.js";
 import { resolveNitroCompiledArtifactsSource } from "#internal/nitro/routes/runtime-artifacts.js";
 import {
   pruneLocalSandboxTemplatesInBackground,
@@ -441,7 +441,7 @@ export async function startDevelopmentServer(
       options.existing === "attach-if-unconfigured" &&
       !hasExplicitEndpoint &&
       owner.kind === "ready" &&
-      isLoopbackServerUrl(owner.url) &&
+      isLocalDevelopmentServerUrl(owner.url) &&
       (await isEveServerHealthy(owner.url))
     ) {
       return {
