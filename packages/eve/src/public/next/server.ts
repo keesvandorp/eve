@@ -1,20 +1,20 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { resolvePackageRoot } from "#internal/application/package.js";
 import { isEveServerHealthy } from "#shared/eve-server-health.js";
 import { isLoopbackHostname } from "#shared/network-address.js";
+import { tryAcquireProcessLock } from "#shared/process-lock.js";
 
 const EVE_BASE_URL_ENV = "EVE_BASE_URL";
 const DEFAULT_SERVER_READY_TIMEOUT_MS = 180_000;
 const DEV_SERVER_REGISTRY_TIMEOUT_MS = 180_000;
 const DEV_SERVER_REGISTRY_POLL_MS = 100;
-const DEV_SERVER_STALE_LOCK_MS = 30_000;
 const EVE_CACHE_DIRECTORY_NAME = ".eve";
 const EVE_NEXT_DEV_SERVER_FILE_NAME = "next-dev-server.json";
-const EVE_NEXT_DEV_SERVER_LOCK_FILE_NAME = "next-dev-server.lock";
+const EVE_NEXT_DEV_SERVER_LOCK_FILE_NAME = "next-dev-server.lock.sqlite";
 const SERVER_URL_CANDIDATE_PATTERN = /https?:\/\/[^\s"'<>]+/g;
 const NEXT_PHASE_PRODUCTION_BUILD = "phase-production-build";
 
@@ -159,25 +159,7 @@ async function writeEveDevServerRegistry(appRoot: string, handle: EveProcessHand
   );
 }
 
-async function removeStaleEveDevServerLock(lockPath: string): Promise<void> {
-  try {
-    const lockStat = await stat(lockPath);
-    if (Date.now() - lockStat.mtimeMs > DEV_SERVER_STALE_LOCK_MS) {
-      await rm(lockPath, {
-        force: true,
-      });
-    }
-  } catch (error) {
-    if (!isNodeErrorWithCode(error, "ENOENT")) {
-      throw error;
-    }
-  }
-}
-
-async function acquireEveDevServerLock(
-  appRoot: string,
-  timeoutMs: number,
-): Promise<() => Promise<void>> {
+async function acquireEveDevServerLock(appRoot: string, timeoutMs: number): Promise<() => void> {
   const cacheDirectory = resolveEveCacheDirectory(appRoot);
   const lockPath = resolveEveDevServerLockPath(appRoot);
   const deadline = Date.now() + timeoutMs;
@@ -187,36 +169,23 @@ async function acquireEveDevServerLock(
   });
 
   while (true) {
-    try {
-      const lockFile = await open(lockPath, "wx");
-      await lockFile.writeFile(`${String(process.pid)}\n`);
-      await lockFile.close();
-
-      return async () => {
-        await rm(lockPath, {
-          force: true,
-        });
-      };
-    } catch (error) {
-      if (!isNodeErrorWithCode(error, "EEXIST")) {
-        throw error;
-      }
-
-      const registeredOrigin = await readUsableEveDevServerRegistry(appRoot);
-      if (registeredOrigin !== undefined) {
-        return async () => {};
-      }
-
-      await removeStaleEveDevServerLock(lockPath);
-
-      if (Date.now() > deadline) {
-        throw new Error(
-          `Timed out after ${timeoutMs}ms waiting for another Next.js process to start eve.`,
-        );
-      }
-
-      await delay(DEV_SERVER_REGISTRY_POLL_MS);
+    const release = tryAcquireProcessLock(lockPath);
+    if (release !== null) {
+      return release;
     }
+
+    const registeredOrigin = await readUsableEveDevServerRegistry(appRoot);
+    if (registeredOrigin !== undefined) {
+      return () => {};
+    }
+
+    if (Date.now() > deadline) {
+      throw new Error(
+        `Timed out after ${timeoutMs}ms waiting for another Next.js process to start eve.`,
+      );
+    }
+
+    await delay(DEV_SERVER_REGISTRY_POLL_MS);
   }
 }
 

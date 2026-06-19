@@ -1,17 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 import { z } from "#compiled/zod/index.js";
+import { acquireProcessLock } from "#shared/process-lock.js";
 import { err, ok, type Result } from "#shared/result.js";
 
 const STATE_FILE_NAME = "dev-server-state.v1.json";
 const LOCK_FILE_NAME = "dev-server-state.lock.sqlite";
 const LEGACY_PROCESS_ID_FILE_NAME = "dev-process.pid";
 const LEGACY_SERVER_FILE_NAME = "dev-server.json";
-const LOCK_POLL_MS = 50;
-const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 
 const processIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const ownerTokenSchema = z.string().min(1);
@@ -349,43 +347,12 @@ export class DevServerStateStore {
 
   async #withLock<T>(callback: () => Promise<T>): Promise<T> {
     await mkdir(this.#stateDir, { recursive: true });
-    const database = await acquireSqliteLock(this.#lockPath);
+    const release = await acquireProcessLock(this.#lockPath);
 
     try {
       return await callback();
     } finally {
-      try {
-        database.exec("ROLLBACK");
-      } finally {
-        database.close();
-      }
-    }
-  }
-}
-
-async function acquireSqliteLock(lockPath: string): Promise<DatabaseSync> {
-  const startedAt = Date.now();
-
-  for (;;) {
-    const database = new DatabaseSync(lockPath, { timeout: 0 });
-
-    try {
-      database.exec("BEGIN IMMEDIATE");
-      return database;
-    } catch (error) {
-      database.close();
-
-      if (!isSqliteBusyError(error)) {
-        throw error;
-      }
-
-      if (Date.now() - startedAt > LOCK_ACQUIRE_TIMEOUT_MS) {
-        throw new Error(`Timed out acquiring dev-server state lock at "${lockPath}".`, {
-          cause: error,
-        });
-      }
-
-      await delay(LOCK_POLL_MS);
+      release();
     }
   }
 }
@@ -454,20 +421,6 @@ function isHttpServerUrl(value: string): boolean {
   }
 }
 
-function isSqliteBusyError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    "code" in error &&
-    error.code === "ERR_SQLITE_ERROR" &&
-    "errcode" in error &&
-    error.errcode === 5
-  );
-}
-
 function isErrnoException(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

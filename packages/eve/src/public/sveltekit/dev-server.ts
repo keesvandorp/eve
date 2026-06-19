@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { resolvePackageRoot } from "#internal/application/package.js";
 import { isEveServerHealthy } from "#shared/eve-server-health.js";
+import { tryAcquireProcessLock } from "#shared/process-lock.js";
 
 import { normalizeOrigin } from "./routing.js";
 
@@ -12,10 +13,9 @@ export const EVE_BASE_URL_ENV = "EVE_BASE_URL";
 const DEFAULT_SERVER_READY_TIMEOUT_MS = 30_000;
 const DEV_SERVER_REGISTRY_TIMEOUT_MS = 30_000;
 const DEV_SERVER_REGISTRY_POLL_MS = 100;
-const DEV_SERVER_STALE_LOCK_MS = 30_000;
 const EVE_CACHE_DIRECTORY_NAME = ".eve";
 const EVE_SVELTEKIT_DEV_SERVER_FILE_NAME = "sveltekit-dev-server.json";
-const EVE_SVELTEKIT_DEV_SERVER_LOCK_FILE_NAME = "sveltekit-dev-server.lock";
+const EVE_SVELTEKIT_DEV_SERVER_LOCK_FILE_NAME = "sveltekit-dev-server.lock.sqlite";
 const LOCAL_SERVER_URL_PATTERN = /https?:\/\/(?:\[[^\]\s]+\]|[^\s/:[\]]+)(?::\d+)?/;
 
 export interface EveProcessHandle {
@@ -111,43 +111,25 @@ async function writeEveDevServerRegistry(appRoot: string, handle: EveProcessHand
   );
 }
 
-async function removeStaleEveDevServerLock(lockPath: string): Promise<void> {
-  try {
-    const lockStat = await stat(lockPath);
-    if (Date.now() - lockStat.mtimeMs > DEV_SERVER_STALE_LOCK_MS) {
-      await rm(lockPath, { force: true });
-    }
-  } catch (error) {
-    if (!isNodeErrorWithCode(error, "ENOENT")) throw error;
-  }
-}
-
-async function acquireEveDevServerLock(appRoot: string): Promise<() => Promise<void>> {
+async function acquireEveDevServerLock(appRoot: string): Promise<() => void> {
   const cacheDirectory = resolveEveCacheDirectory(appRoot);
   const lockPath = resolveEveDevServerLockPath(appRoot);
   const deadline = Date.now() + DEV_SERVER_REGISTRY_TIMEOUT_MS;
   await mkdir(cacheDirectory, { recursive: true });
 
   while (true) {
-    try {
-      const lockFile = await open(lockPath, "wx");
-      await lockFile.writeFile(`${String(process.pid)}\n`);
-      await lockFile.close();
-      return async () => {
-        await rm(lockPath, { force: true });
-      };
-    } catch (error) {
-      if (!isNodeErrorWithCode(error, "EEXIST")) throw error;
-      const registeredOrigin = await readUsableEveDevServerRegistry(appRoot);
-      if (registeredOrigin !== undefined) return async () => {};
-      await removeStaleEveDevServerLock(lockPath);
-      if (Date.now() > deadline) {
-        throw new Error(
-          `Timed out after ${DEV_SERVER_REGISTRY_TIMEOUT_MS}ms waiting for another SvelteKit process to start eve.`,
-        );
-      }
-      await delay(DEV_SERVER_REGISTRY_POLL_MS);
+    const release = tryAcquireProcessLock(lockPath);
+    if (release !== null) return release;
+
+    const registeredOrigin = await readUsableEveDevServerRegistry(appRoot);
+    if (registeredOrigin !== undefined) return () => {};
+
+    if (Date.now() > deadline) {
+      throw new Error(
+        `Timed out after ${DEV_SERVER_REGISTRY_TIMEOUT_MS}ms waiting for another SvelteKit process to start eve.`,
+      );
     }
+    await delay(DEV_SERVER_REGISTRY_POLL_MS);
   }
 }
 
