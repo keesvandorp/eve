@@ -61,13 +61,20 @@ function mergeProxyConfig(
   };
 }
 
-async function resolveEveDevProxyTarget(appRoot: string): Promise<string> {
+async function resolveEveDevProxyTarget(
+  appRoot: string,
+  onDevServerSpawned: (close: () => Promise<void>) => void,
+): Promise<string> {
   const configuredEveBaseUrl = process.env[EVE_BASE_URL_ENV]?.trim();
   if (configuredEveBaseUrl && configuredEveBaseUrl.length > 0) {
     return normalizeOrigin(configuredEveBaseUrl);
   }
 
-  return (await resolveSharedEveDevServer(appRoot)).origin;
+  const handle = await resolveSharedEveDevServer(appRoot);
+  if (handle.close !== undefined) {
+    onDevServerSpawned(handle.close);
+  }
+  return handle.origin;
 }
 
 /**
@@ -85,6 +92,7 @@ async function resolveEveDevProxyTarget(appRoot: string): Promise<string> {
 export function eveSvelteKit(options: EveSvelteKitPluginOptions = {}): Plugin {
   let svelteKitRoot = process.cwd();
   let appRoot = resolveApplicationRoot(svelteKitRoot, options.eveRoot);
+  let closeDevelopmentServer: (() => Promise<void>) | undefined;
   const servicePrefix = normalizeRoutePrefix(options.servicePrefix ?? EVE_SVELTEKIT_SERVICE_PREFIX);
   const shouldConfigureVercelJson = options.configureVercelJson !== false;
 
@@ -108,7 +116,9 @@ export function eveSvelteKit(options: EveSvelteKitPluginOptions = {}): Plugin {
         return {};
       }
 
-      const proxyTarget = await resolveEveDevProxyTarget(appRoot);
+      const proxyTarget = await resolveEveDevProxyTarget(appRoot, (close) => {
+        closeDevelopmentServer = close;
+      });
 
       if (env.isPreview) {
         return {
@@ -123,6 +133,10 @@ export function eveSvelteKit(options: EveSvelteKitPluginOptions = {}): Plugin {
           proxy: mergeProxyConfig(config.server?.proxy, proxyTarget),
         },
       };
+    },
+    async closeBundle() {
+      await closeDevelopmentServer?.();
+      closeDevelopmentServer = undefined;
     },
   };
 }

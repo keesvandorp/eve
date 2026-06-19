@@ -28,6 +28,13 @@ function getConfigHook(plugin: Plugin): ConfigHook {
   return plugin.config as ConfigHook;
 }
 
+function getCloseBundleHook(plugin: Plugin): () => unknown {
+  if (typeof plugin.closeBundle !== "function") {
+    throw new Error("expected plugin closeBundle hook");
+  }
+  return plugin.closeBundle as () => unknown;
+}
+
 afterEach(() => {
   vi.clearAllMocks();
   vi.unstubAllEnvs();
@@ -86,6 +93,20 @@ describe("eveSvelteKit", () => {
         },
       },
     });
+  });
+
+  it("closes a development server spawned by this plugin", async () => {
+    const close = vi.fn(async () => {});
+    resolveSharedEveDevServerMock.mockResolvedValueOnce({
+      close,
+      origin: "http://127.0.0.1:49152",
+    });
+    const plugin = eveSvelteKit();
+
+    await getConfigHook(plugin)({}, { command: "serve", mode: "development" });
+    await getCloseBundleHook(plugin)();
+
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("prefers EVE_BASE_URL over spawning a shared server", async () => {

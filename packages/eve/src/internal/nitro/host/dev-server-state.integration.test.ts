@@ -6,9 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  type DevServerClaim,
-  type DevServerState,
-  DevServerStateStore,
+  type DevelopmentServerClaim,
+  type DevelopmentServerClaimAttempt,
+  DevelopmentServerState,
 } from "#internal/nitro/host/dev-server-state.js";
 import type { Result } from "#shared/result.js";
 
@@ -16,13 +16,13 @@ const DEAD_PID = 2_147_483_646;
 const STATE_FILE_NAME = "dev-server-state.v1.json";
 const LOCK_FILE_NAME = "dev-server-state.lock.sqlite";
 
-describe("DevServerStateStore", () => {
+describe("DevelopmentServerState", () => {
   let appRoot: string;
-  let store: DevServerStateStore;
+  let store: DevelopmentServerState;
 
   beforeEach(async () => {
     appRoot = await mkdtemp(join(tmpdir(), "eve-dev-server-state-"));
-    store = new DevServerStateStore(appRoot);
+    store = new DevelopmentServerState({ appRoot });
   });
 
   afterEach(async () => {
@@ -43,47 +43,72 @@ describe("DevServerStateStore", () => {
     return JSON.parse(await readFile(join(appRoot, ".eve", STATE_FILE_NAME), "utf8"));
   }
 
-  function requireClaimed(result: Result<DevServerClaim, unknown>): string {
+  function requireClaimed(
+    result: Result<DevelopmentServerClaimAttempt, unknown>,
+  ): DevelopmentServerClaim {
     if (!result.ok || result.value.kind !== "claimed") {
       throw new Error(`Expected a claimed result, received ${JSON.stringify(result)}.`);
     }
-    return result.value.ownerToken;
+    return result.value.claim;
   }
 
-  it("claims an absent record and persists its generated owner token", async () => {
-    const claim = await store.claim(process.pid);
-    const ownerToken = requireClaimed(claim);
-
-    expect(await readRawRecord()).toEqual({
-      kind: "starting",
-      ownerToken,
-      pid: process.pid,
+  it("observes an absent root as vacant", async () => {
+    await expect(store.inspect()).resolves.toEqual({
+      ok: true,
+      value: { kind: "vacant" },
     });
   });
 
-  it("publishes a ready URL for the current owner", async () => {
-    const ownerToken = requireClaimed(await store.claim(process.pid));
+  it("observes a live ready owner without exposing its claim token", async () => {
+    const stateClaim = requireClaimed(await store.claim());
+    await stateClaim.publish("http://127.0.0.1:2000/");
 
-    await expect(store.publish({ ownerToken, url: "http://127.0.0.1:2000/" })).resolves.toEqual({
+    await expect(store.inspect()).resolves.toEqual({
+      ok: true,
+      value: {
+        kind: "ready",
+        pid: process.pid,
+        url: "http://127.0.0.1:2000/",
+      },
+    });
+  });
+
+  it("claims an absent record and persists its generated owner token", async () => {
+    const claim = await store.claim();
+    const stateClaim = requireClaimed(claim);
+    const record = await readRawRecord();
+
+    expect(record).toEqual({
+      kind: "starting",
+      ownerToken: expect.any(String),
+      pid: process.pid,
+    });
+    expect(stateClaim.pid).toBe(process.pid);
+  });
+
+  it("publishes a ready URL for the current owner", async () => {
+    const stateClaim = requireClaimed(await store.claim());
+
+    await expect(stateClaim.publish("http://127.0.0.1:2000/")).resolves.toEqual({
       ok: true,
       value: undefined,
     });
-    expect(await readRawRecord()).toEqual({
+    expect(await readRawRecord()).toMatchObject({
       kind: "ready",
-      ownerToken,
+      ownerToken: expect.any(String),
       pid: process.pid,
       url: "http://127.0.0.1:2000/",
     });
   });
 
   it("marks a ready owner as closing before release", async () => {
-    const ownerToken = requireClaimed(await store.claim(process.pid));
-    await store.publish({ ownerToken, url: "http://127.0.0.1:2000/" });
+    const stateClaim = requireClaimed(await store.claim());
+    await stateClaim.publish("http://127.0.0.1:2000/");
 
-    await expect(store.markClosing(ownerToken)).resolves.toEqual({ ok: true, value: undefined });
-    await expect(readRawRecord()).resolves.toEqual({
+    await expect(stateClaim.markClosing()).resolves.toEqual({ ok: true, value: undefined });
+    await expect(readRawRecord()).resolves.toMatchObject({
       kind: "closing",
-      ownerToken,
+      ownerToken: expect.any(String),
       pid: process.pid,
     });
     await expect(readFile(join(appRoot, ".eve", "dev-server.json"), "utf8")).rejects.toMatchObject({
@@ -95,17 +120,17 @@ describe("DevServerStateStore", () => {
   });
 
   it("does not publish a closing owner as ready again", async () => {
-    const ownerToken = requireClaimed(await store.claim(process.pid));
-    await store.publish({ ownerToken, url: "http://127.0.0.1:2000/" });
-    await store.markClosing(ownerToken);
+    const stateClaim = requireClaimed(await store.claim());
+    await stateClaim.publish("http://127.0.0.1:2000/");
+    await stateClaim.markClosing();
 
-    await expect(store.publish({ ownerToken, url: "http://127.0.0.1:3000/" })).resolves.toEqual({
+    await expect(stateClaim.publish("http://127.0.0.1:3000/")).resolves.toEqual({
       error: { from: "closing", kind: "invalid-transition", to: "ready" },
       ok: false,
     });
-    await expect(readRawRecord()).resolves.toEqual({
+    await expect(readRawRecord()).resolves.toMatchObject({
       kind: "closing",
-      ownerToken,
+      ownerToken: expect.any(String),
       pid: process.pid,
     });
     await expect(readFile(join(appRoot, ".eve", "dev-server.json"), "utf8")).rejects.toMatchObject({
@@ -114,8 +139,8 @@ describe("DevServerStateStore", () => {
   });
 
   it("returns an active starting owner instead of replacing it", async () => {
-    requireClaimed(await store.claim(process.pid));
-    const second = await store.claim(process.pid);
+    requireClaimed(await store.claim());
+    const second = await store.claim();
 
     expect(second).toEqual({
       ok: true,
@@ -127,11 +152,8 @@ describe("DevServerStateStore", () => {
   });
 
   it("serializes simultaneous claims so exactly one caller owns the root", async () => {
-    const otherStore = new DevServerStateStore(appRoot);
-    const [first, second] = await Promise.all([
-      store.claim(process.pid),
-      otherStore.claim(process.pid),
-    ]);
+    const otherStore = new DevelopmentServerState({ appRoot });
+    const [first, second] = await Promise.all([store.claim(), otherStore.claim()]);
     const results = [first, second];
     const claimed = results.find((result) => result.ok && result.value.kind === "claimed");
     const occupied = results.find((result) => result.ok && result.value.kind === "occupied");
@@ -148,7 +170,7 @@ describe("DevServerStateStore", () => {
     ) {
       throw new Error("Expected one claimed and one occupied result.");
     }
-    expect(await readRawRecord()).toMatchObject({ ownerToken: claimed.value.ownerToken });
+    expect(await readRawRecord()).toMatchObject({ ownerToken: expect.any(String) });
   });
 
   it("waits for the process-safe lock instead of taking over a live holder", async () => {
@@ -156,7 +178,7 @@ describe("DevServerStateStore", () => {
     const blocker = new DatabaseSync(join(appRoot, ".eve", LOCK_FILE_NAME), { timeout: 0 });
     blocker.exec("BEGIN IMMEDIATE");
     let claimSettled = false;
-    const claimPromise = store.claim(process.pid).finally(() => {
+    const claimPromise = store.claim().finally(() => {
       claimSettled = true;
     });
 
@@ -172,15 +194,19 @@ describe("DevServerStateStore", () => {
   it("reclaims a record owned by a dead process", async () => {
     await writeRawRecord({ kind: "starting", ownerToken: "stale", pid: DEAD_PID });
 
-    const ownerToken = requireClaimed(await store.claim(process.pid));
+    requireClaimed(await store.claim());
 
-    expect(ownerToken).not.toBe("stale");
+    expect(await readRawRecord()).toMatchObject({
+      kind: "starting",
+      ownerToken: expect.not.stringMatching(/^stale$/u),
+      pid: process.pid,
+    });
   });
 
   it("returns a live non-loopback owner without probing its persisted URL", async () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
-    const state: DevServerState = {
+    const state = {
       kind: "ready",
       ownerToken: "incumbent",
       pid: process.pid,
@@ -188,7 +214,7 @@ describe("DevServerStateStore", () => {
     };
     await writeRawRecord(state);
 
-    expect(await store.claim(process.pid)).toEqual({
+    expect(await store.claim()).toEqual({
       ok: true,
       value: {
         kind: "occupied",
@@ -201,7 +227,7 @@ describe("DevServerStateStore", () => {
   it("keeps a live ready owner without using health as an ownership signal", async () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 503 }));
     vi.stubGlobal("fetch", fetchMock);
-    const state: DevServerState = {
+    const state = {
       kind: "ready",
       ownerToken: "incumbent",
       pid: process.pid,
@@ -209,7 +235,7 @@ describe("DevServerStateStore", () => {
     };
     await writeRawRecord(state);
 
-    expect(await store.claim(process.pid)).toEqual({
+    expect(await store.claim()).toEqual({
       ok: true,
       value: {
         kind: "occupied",
@@ -232,7 +258,7 @@ describe("DevServerStateStore", () => {
       "utf8",
     );
 
-    await expect(store.claim(process.pid)).resolves.toEqual({
+    await expect(store.claim()).resolves.toEqual({
       ok: true,
       value: {
         kind: "occupied",
@@ -253,7 +279,7 @@ describe("DevServerStateStore", () => {
       "utf8",
     );
 
-    requireClaimed(await store.claim(process.pid));
+    requireClaimed(await store.claim());
   });
 
   it("ignores legacy metadata when its process marker is dead", async () => {
@@ -265,17 +291,17 @@ describe("DevServerStateStore", () => {
       "utf8",
     );
 
-    requireClaimed(await store.claim(process.pid));
+    requireClaimed(await store.claim());
   });
 
   it("publishes compatibility records for Eve versions from before the transition", async () => {
-    const ownerToken = requireClaimed(await store.claim(process.pid));
+    const stateClaim = requireClaimed(await store.claim());
     const legacyProcessIdPath = join(appRoot, ".eve", "dev-process.pid");
     const legacyServerPath = join(appRoot, ".eve", "dev-server.json");
 
     await expect(readFile(legacyProcessIdPath, "utf8")).resolves.toBe(`${process.pid}\n`);
 
-    await store.publish({ ownerToken, url: "http://127.0.0.1:2000/" });
+    await stateClaim.publish("http://127.0.0.1:2000/");
     await expect(readFile(legacyServerPath, "utf8")).resolves.toSatisfy((raw: string) => {
       expect(JSON.parse(raw)).toMatchObject({
         pid: process.pid,
@@ -284,7 +310,7 @@ describe("DevServerStateStore", () => {
       return true;
     });
 
-    await store.release(ownerToken);
+    await stateClaim.release();
     await expect(readFile(legacyProcessIdPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(legacyServerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -296,7 +322,7 @@ describe("DevServerStateStore", () => {
       "{ not json",
     ]) {
       await writeRawRecord(record);
-      const claim = await store.claim(process.pid);
+      const claim = await store.claim();
 
       expect(claim).toMatchObject({ error: { kind: "io" }, ok: false });
       expect(await readFile(join(appRoot, ".eve", STATE_FILE_NAME), "utf8")).toBe(
@@ -306,45 +332,55 @@ describe("DevServerStateStore", () => {
   });
 
   it("rejects publication after ownership is lost", async () => {
-    await expect(
-      store.publish({ ownerToken: "missing", url: "http://127.0.0.1:2000/" }),
-    ).resolves.toEqual({
+    const stateClaim = requireClaimed(await store.claim());
+    await stateClaim.release();
+
+    await expect(stateClaim.publish("http://127.0.0.1:2000/")).resolves.toEqual({
       ok: false,
       error: { kind: "ownership-lost", pid: null },
     });
   });
 
   it("preserves a successor record when publication loses ownership", async () => {
-    const ownerToken = requireClaimed(await store.claim(process.pid));
-    const successor: DevServerState = {
+    const stateClaim = requireClaimed(await store.claim());
+    const successor = {
       kind: "starting",
       ownerToken: "successor",
       pid: process.pid,
     };
     await writeRawRecord(successor);
 
-    await expect(store.publish({ ownerToken, url: "http://127.0.0.1:2000/" })).resolves.toEqual({
+    await expect(stateClaim.publish("http://127.0.0.1:2000/")).resolves.toEqual({
       error: { kind: "ownership-lost", pid: process.pid },
       ok: false,
     });
     await expect(readRawRecord()).resolves.toEqual(successor);
   });
 
-  it("releases only the matching owner token", async () => {
-    const ownerToken = requireClaimed(await store.claim(process.pid));
+  it("does not let an old claim release a successor", async () => {
+    const stateClaim = requireClaimed(await store.claim());
+    const successor = {
+      kind: "starting",
+      ownerToken: "successor",
+      pid: process.pid,
+    };
+    await writeRawRecord(successor);
 
-    await store.release("someone-else");
-    expect(await store.claim(process.pid)).toMatchObject({
-      ok: true,
-      value: { kind: "occupied" },
-    });
+    await stateClaim.release();
 
-    await store.release(ownerToken);
-    expect((await store.claim(process.pid)).ok).toBe(true);
+    await expect(readRawRecord()).resolves.toEqual(successor);
+  });
+
+  it("releases the matching claim", async () => {
+    const stateClaim = requireClaimed(await store.claim());
+
+    await stateClaim.release();
+
+    expect((await store.claim()).ok).toBe(true);
   });
 
   it("writes a single trailing-newline JSON record", async () => {
-    await store.claim(process.pid);
+    await store.claim();
 
     const raw = await readFile(join(appRoot, ".eve", STATE_FILE_NAME), "utf8");
     expect(raw.endsWith("\n")).toBe(true);

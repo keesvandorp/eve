@@ -1,4 +1,3 @@
-import type { ChildProcess } from "node:child_process";
 import { isAbsolute, resolve } from "node:path";
 
 import { addImports, defineNuxtModule, extendRouteRules } from "@nuxt/kit";
@@ -80,13 +79,13 @@ interface NitroVercelConfigHost {
  * the Vercel private service or a configured origin/port.
  *
  * When a dev server is spawned by this process, `onDevServerSpawned` is invoked
- * with the child handle so the caller can wire lifecycle-scoped cleanup.
+ * with its teardown capability so the caller can wire lifecycle-scoped cleanup.
  */
 async function resolveEveProxyTarget(input: {
   readonly appRoot: string;
   readonly dev: boolean;
   readonly servicePrefix: string;
-  readonly onDevServerSpawned?: (child: ChildProcess) => void;
+  readonly onDevServerSpawned?: (close: () => Promise<void>) => void;
 }): Promise<string> {
   if (!input.dev) {
     return resolveProductionTarget(input.servicePrefix);
@@ -98,8 +97,8 @@ async function resolveEveProxyTarget(input: {
   }
 
   const handle = await resolveSharedEveDevServer(input.appRoot);
-  if (handle.process !== undefined) {
-    input.onDevServerSpawned?.(handle.process);
+  if (handle.close !== undefined) {
+    input.onDevServerSpawned?.(handle.close);
   }
 
   return joinRoutePrefix(handle.origin, EVE_ROUTE_PREFIX);
@@ -160,16 +159,12 @@ export default defineNuxtModule<EveNuxtModuleOptions>({
           appRoot,
           dev: nuxt.options.dev,
           servicePrefix,
-          onDevServerSpawned: (child) => {
+          onDevServerSpawned: (close) => {
             // Prefer Nuxt's lifecycle for cleanup so the dev server is torn
             // down on graceful shutdown and dev restarts. The process-exit
-            // guard in dev-server.ts remains as a fallback for non-graceful
-            // exits.
-            nuxt.hook("close", () => {
-              if (!child.killed) {
-                child.kill();
-              }
-            });
+            // guard in the shared resolver remains as a fallback for
+            // non-graceful exits.
+            nuxt.hook("close", close);
           },
         });
 

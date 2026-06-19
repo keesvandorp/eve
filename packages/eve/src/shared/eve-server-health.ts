@@ -5,18 +5,22 @@ const DEFAULT_EVE_SERVER_HEALTH_TIMEOUT_MS = 1_000;
 /** Returns whether an Eve server answers its health route successfully. */
 export async function isEveServerHealthy(
   serverUrl: string,
-  timeoutMs: number = DEFAULT_EVE_SERVER_HEALTH_TIMEOUT_MS,
+  options: {
+    readonly signal?: AbortSignal;
+    readonly timeoutMs?: number;
+  } = {},
 ): Promise<boolean> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutSignal = AbortSignal.timeout(
+    options.timeoutMs ?? DEFAULT_EVE_SERVER_HEALTH_TIMEOUT_MS,
+  );
+  const signal =
+    options.signal === undefined ? timeoutSignal : AbortSignal.any([options.signal, timeoutSignal]);
 
   try {
     const healthUrl = new URL(EVE_HEALTH_ROUTE_PATH, serverUrl).toString();
-    const response = await fetch(healthUrl, { signal: controller.signal });
+    const response = await fetch(healthUrl, { signal });
     return response.ok;
   } catch {
     return false;
-  } finally {
-    clearTimeout(timeout);
   }
 }

@@ -12,9 +12,9 @@ import type { AuthoredSourceWatcherHandle } from "#internal/nitro/host/dev-autho
 import { prepareApplicationHost } from "#internal/nitro/host/prepare-application-host.js";
 import { resolveDiscoveryProject } from "#discover/project.js";
 import {
-  type DevServerOwner,
-  type DevServerStateMutationError,
-  DevServerStateStore,
+  type DevelopmentServerOwner,
+  DevelopmentServerState,
+  type DevelopmentServerStateMutationError,
 } from "#internal/nitro/host/dev-server-state.js";
 import { toErrorMessage } from "#shared/errors.js";
 import { isEveServerHealthy } from "#shared/eve-server-health.js";
@@ -149,7 +149,7 @@ async function formatDevelopmentServerConnectCommand(
 
 async function createDevelopmentServerAlreadyRunningError(
   appRoot: string,
-  owner: DevServerOwner,
+  owner: DevelopmentServerOwner,
 ): Promise<Error> {
   const connectUrl = owner.kind === "ready" ? owner.url : DEVELOPMENT_SERVER_URL_PLACEHOLDER;
   const connectCommand = await formatDevelopmentServerConnectCommand(appRoot, connectUrl);
@@ -164,7 +164,7 @@ async function createDevelopmentServerAlreadyRunningError(
 
 function createDevelopmentServerStateMutationError(
   action: "mark dev server as closing" | "publish dev server state" | "release dev server state",
-  error: DevServerStateMutationError,
+  error: DevelopmentServerStateMutationError,
 ): Error {
   if (error.kind === "ownership-lost") {
     const owner = error.pid === null ? "another process" : `pid ${error.pid}`;
@@ -425,8 +425,8 @@ export async function startDevelopmentServer(
   const requestedPort = options.port ?? environmentPort;
   const hasExplicitEndpoint =
     options.host !== undefined || options.port !== undefined || environmentPort !== undefined;
-  const stateStore = new DevServerStateStore(project.appRoot);
-  const claim = await stateStore.claim(process.pid);
+  const state = new DevelopmentServerState(project);
+  const claim = await state.claim();
 
   if (!claim.ok) {
     throw new Error(
@@ -453,7 +453,7 @@ export async function startDevelopmentServer(
     throw await createDevelopmentServerAlreadyRunningError(project.appRoot, owner);
   }
 
-  const ownerToken = claim.value.ownerToken;
+  const stateClaim = claim.value.claim;
   const previousDevelopmentSandboxRunId = process.env[EVE_DEVELOPMENT_SANDBOX_RUN_ID_ENV];
   const developmentSandboxRunId = createDevelopmentSandboxRunId();
   process.env[EVE_DEVELOPMENT_SANDBOX_RUN_ID_ENV] = developmentSandboxRunId;
@@ -461,7 +461,7 @@ export async function startDevelopmentServer(
   let devServer: NitroDevelopmentServer | undefined;
   let restoreWorkflowLocalQueueEnvironment: (() => void) | undefined;
   let authoredSourceWatcher: AuthoredSourceWatcherHandle | undefined;
-  const releaseDevelopmentProcess = () => stateStore.release(ownerToken);
+  const releaseDevelopmentProcess = () => stateClaim.release();
 
   try {
     const preparedHost = await devBootPhase(
@@ -532,7 +532,7 @@ export async function startDevelopmentServer(
       },
       options.onBootProgress,
     );
-    const publication = await stateStore.publish({ ownerToken, url: serverUrl });
+    const publication = await stateClaim.publish(serverUrl);
     if (!publication.ok) {
       throw createDevelopmentServerStateMutationError(
         "publish dev server state",
@@ -563,7 +563,7 @@ export async function startDevelopmentServer(
         let releaseFailed = false;
         const currentClose = (async () => {
           if (cleanupResult === undefined) {
-            const closing = await stateStore.markClosing(ownerToken);
+            const closing = await stateClaim.markClosing();
             if (!closing.ok && closing.error.kind !== "ownership-lost") {
               throw createDevelopmentServerStateMutationError(
                 "mark dev server as closing",

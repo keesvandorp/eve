@@ -82,7 +82,7 @@ For a public demo, use `none()` (also from `eve/channels/auth`) to skip authenti
 
 ## Dev vs deploy topology
 
-- **Local dev.** `npm run dev` boots the eve dev server next to SvelteKit and proxies the eve routes to it, so the browser only ever hits the SvelteKit origin. `npm run build && npm run preview` behaves the same way: the preview server gets its own eve route proxy and either reuses the shared eve server or starts one.
+- **Local dev.** `npm run dev` boots the eve dev server next to SvelteKit and proxies the eve routes to it, so the browser only ever hits the SvelteKit origin. If the same app root already has a server from `eve dev` or another framework process, SvelteKit reuses it. `npm run build && npm run preview` behaves the same way: the preview server gets its own eve route proxy and either reuses the shared eve server or starts one.
 - **Vercel.** The SvelteKit app and the eve runtime deploy as a single project. The web app is public; the eve runtime sits behind it on the same origin. Use `eveBuildCommand` for a project-specific agent build:
 
   ```ts

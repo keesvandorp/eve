@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
 
 const DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 const LOCK_POLL_MS = 50;
@@ -39,7 +40,12 @@ export function tryAcquireProcessLock(lockPath: string): (() => void) | null {
 
   try {
     database.exec("BEGIN IMMEDIATE");
-    return () => releaseProcessLock(database);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseProcessLock(database);
+    };
   } catch (error) {
     database.close();
 
@@ -64,20 +70,27 @@ export async function acquireProcessLock(
   options: { readonly timeoutMs?: number } = {},
 ): Promise<() => void> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS;
-  const startedAt = Date.now();
+  const deadline = Date.now() + timeoutMs;
+  let firstAttempt = true;
 
   for (;;) {
+    if (!firstAttempt && Date.now() >= deadline) {
+      throw new Error(`Timed out acquiring lock at "${lockPath}".`);
+    }
+    firstAttempt = false;
+
     const release = tryAcquireProcessLock(lockPath);
 
     if (release !== null) {
       return release;
     }
 
-    if (Date.now() - startedAt > timeoutMs) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
       throw new Error(`Timed out acquiring lock at "${lockPath}".`);
     }
 
-    await delay(LOCK_POLL_MS);
+    await delay(Math.min(LOCK_POLL_MS, remainingMs));
   }
 }
 
@@ -89,8 +102,4 @@ function isSqliteBusyError(error: unknown): boolean {
     "errcode" in error &&
     error.errcode === SQLITE_BUSY_ERRCODE
   );
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -6,7 +6,7 @@ import type { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 
 import { EVE_HEALTH_ROUTE_PATH } from "../../src/protocol/routes.js";
-import { DevServerStateStore } from "../../src/internal/nitro/host/dev-server-state.js";
+import { DevelopmentServerState } from "../../src/internal/nitro/host/dev-server-state.js";
 import { WEATHER_AGENT_DESCRIPTOR } from "../../src/internal/testing/scenario-apps/weather-agent.js";
 import {
   type ScenarioAppDescriptor,
@@ -455,14 +455,14 @@ describe("eve dev server", () => {
     async () => {
       const appRoot = await createScratchDirectory("eve-dev-state-lock-");
       await crashStateLockHolder(appRoot);
-      const stateStore = new DevServerStateStore(appRoot);
-      const recoveredClaim = await stateStore.claim(process.pid);
+      const state = new DevelopmentServerState({ appRoot });
+      const recoveredClaim = await state.claim();
 
       expect(recoveredClaim).toMatchObject({ ok: true, value: { kind: "claimed" } });
       if (!recoveredClaim.ok || recoveredClaim.value.kind !== "claimed") {
         throw new Error("Expected to claim the app root after the lock-holder process crashed.");
       }
-      await stateStore.release(recoveredClaim.value.ownerToken);
+      await recoveredClaim.value.claim.release();
     },
     DEV_SERVER_SCENARIO_TIMEOUT_MS,
   );

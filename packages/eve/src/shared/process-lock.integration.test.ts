@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -26,6 +27,7 @@ describe("process-lock", () => {
     expect(tryAcquireProcessLock(lockPath)).toBeNull();
 
     release?.();
+    expect(() => release?.()).not.toThrow();
 
     const reacquired = tryAcquireProcessLock(lockPath);
     expect(reacquired).not.toBeNull();
@@ -72,7 +74,3 @@ describe("process-lock", () => {
     releaseB?.();
   });
 });
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}

@@ -50,24 +50,35 @@ const legacyDevServerMetadataSchema = z.object({
 });
 
 /** Persisted ownership state for one app root. */
-export type DevServerState = Readonly<z.infer<typeof devServerStateSchema>>;
+type PersistedDevelopmentServerState = Readonly<z.infer<typeof devServerStateSchema>>;
 
 /** A live process that currently owns the app root. */
-export type DevServerOwner =
+export type DevelopmentServerOwner =
   | { readonly kind: "starting"; readonly pid: number }
   | { readonly kind: "ready"; readonly pid: number; readonly url: string }
   | { readonly kind: "closing"; readonly pid: number };
 
-/** The result of atomically claiming a project root. */
-export type DevServerClaim =
-  | { readonly kind: "claimed"; readonly ownerToken: string }
-  | { readonly kind: "occupied"; readonly owner: DevServerOwner };
+/** The live ownership visible to processes that do not own the claim. */
+export type DevelopmentServerObservation = { readonly kind: "vacant" } | DevelopmentServerOwner;
 
-/** Why {@link DevServerStateStore.claim} could not inspect or persist state. */
-export type DevServerClaimError = { readonly kind: "io"; readonly cause: unknown };
+/** Mutation capability held only by the process that won a claim. */
+export interface DevelopmentServerClaim {
+  readonly pid: number;
+  markClosing(): Promise<Result<void, DevelopmentServerStateMutationError>>;
+  publish(url: string): Promise<Result<void, DevelopmentServerStateMutationError>>;
+  release(): Promise<void>;
+}
+
+/** The result of atomically claiming a project root. */
+export type DevelopmentServerClaimAttempt =
+  | { readonly kind: "claimed"; readonly claim: DevelopmentServerClaim }
+  | { readonly kind: "occupied"; readonly owner: DevelopmentServerOwner };
+
+/** Why {@link DevelopmentServerState.claim} could not inspect or persist state. */
+export type DevelopmentServerStateError = { readonly kind: "io"; readonly cause: unknown };
 
 /** Why an owned dev-server state transition could not be persisted. */
-export type DevServerStateMutationError =
+export type DevelopmentServerStateMutationError =
   | { readonly kind: "io"; readonly cause: unknown }
   | { readonly kind: "invalid-transition"; readonly from: "closing"; readonly to: "ready" }
   | { readonly kind: "ownership-lost"; readonly pid: number | null };
@@ -87,23 +98,38 @@ export function isProcessRunning(pid: number): boolean {
  * cross-process mutex; the JSON record remains the inspectable source of
  * ownership and attachment data.
  */
-export class DevServerStateStore {
+export class DevelopmentServerState {
+  readonly appRoot: string;
   readonly #stateDir: string;
   readonly #statePath: string;
   readonly #lockPath: string;
   readonly #legacyProcessIdPath: string;
   readonly #legacyServerPath: string;
 
-  constructor(appRoot: string) {
-    this.#stateDir = join(appRoot, ".eve");
+  constructor(project: { readonly appRoot: string }) {
+    this.appRoot = project.appRoot;
+    this.#stateDir = join(this.appRoot, ".eve");
     this.#statePath = join(this.#stateDir, STATE_FILE_NAME);
     this.#lockPath = join(this.#stateDir, LOCK_FILE_NAME);
     this.#legacyProcessIdPath = join(this.#stateDir, LEGACY_PROCESS_ID_FILE_NAME);
     this.#legacyServerPath = join(this.#stateDir, LEGACY_SERVER_FILE_NAME);
   }
 
-  /** Atomically returns the live owner or records a fresh starting claim. */
-  async claim(pid: number): Promise<Result<DevServerClaim, DevServerClaimError>> {
+  /** Returns the live owner without exposing its mutation capability. */
+  async inspect(
+    options: { readonly timeoutMs?: number } = {},
+  ): Promise<Result<DevelopmentServerObservation, DevelopmentServerStateError>> {
+    try {
+      const owner = await this.#withLock(() => this.#loadOwner(), options);
+      return ok(owner ?? { kind: "vacant" });
+    } catch (cause) {
+      return err({ kind: "io", cause });
+    }
+  }
+
+  /** Atomically returns the live owner or records this process as a fresh starting claim. */
+  async claim(): Promise<Result<DevelopmentServerClaimAttempt, DevelopmentServerStateError>> {
+    const pid = process.pid;
     try {
       return await this.#withLock(async () => {
         const loaded = await this.#load();
@@ -124,19 +150,28 @@ export class DevServerStateStore {
         await this.#removeLegacyState();
         const ownerToken = randomUUID();
         await this.#writeClaimRecords({ kind: "starting", ownerToken, pid });
-        return ok({ kind: "claimed", ownerToken });
+        return ok({ kind: "claimed", claim: this.#createClaim(pid, ownerToken) });
       });
     } catch (cause) {
-      const owner = await this.#loadOwnerWithoutLock().catch(() => undefined);
+      const owner = await this.#loadOwner().catch(() => undefined);
       return owner === undefined ? err({ kind: "io", cause }) : ok({ kind: "occupied", owner });
     }
   }
 
+  #createClaim(pid: number, ownerToken: string): DevelopmentServerClaim {
+    return Object.freeze({
+      pid,
+      markClosing: () => this.#markClosing(ownerToken),
+      publish: (url: string) => this.#publish(ownerToken, url),
+      release: () => this.#release(ownerToken),
+    });
+  }
+
   /** Publishes the URL for a claim that still owns the app root. */
-  async publish(input: {
-    readonly ownerToken: string;
-    readonly url: string;
-  }): Promise<Result<void, DevServerStateMutationError>> {
+  async #publish(
+    ownerToken: string,
+    url: string,
+  ): Promise<Result<void, DevelopmentServerStateMutationError>> {
     try {
       return await this.#withLock(async () => {
         const loaded = await this.#load();
@@ -145,7 +180,7 @@ export class DevServerStateStore {
           throw this.#createCorruptStateError(loaded.cause);
         }
 
-        if (loaded.kind !== "ok" || loaded.state.ownerToken !== input.ownerToken) {
+        if (loaded.kind !== "ok" || loaded.state.ownerToken !== ownerToken) {
           return err({
             kind: "ownership-lost",
             pid: loaded.kind === "ok" ? loaded.state.pid : null,
@@ -156,13 +191,13 @@ export class DevServerStateStore {
           return err({ kind: "invalid-transition", from: "closing", to: "ready" });
         }
 
-        await this.#writeLegacyMetadata(loaded.state.pid, input.url);
+        await this.#writeLegacyMetadata(loaded.state.pid, url);
         try {
           await this.#writeAtomic({
             kind: "ready",
-            ownerToken: input.ownerToken,
+            ownerToken,
             pid: loaded.state.pid,
-            url: input.url,
+            url,
           });
         } catch (cause) {
           try {
@@ -183,7 +218,9 @@ export class DevServerStateStore {
   }
 
   /** Makes an owned server non-attachable before its resources begin closing. */
-  async markClosing(ownerToken: string): Promise<Result<void, DevServerStateMutationError>> {
+  async #markClosing(
+    ownerToken: string,
+  ): Promise<Result<void, DevelopmentServerStateMutationError>> {
     try {
       return await this.#withLock(async () => {
         const loaded = await this.#load();
@@ -213,7 +250,7 @@ export class DevServerStateStore {
   }
 
   /** Removes the record only when `ownerToken` still owns it. */
-  async release(ownerToken: string): Promise<void> {
+  async #release(ownerToken: string): Promise<void> {
     await this.#withLock(async () => {
       const loaded = await this.#load();
 
@@ -230,8 +267,12 @@ export class DevServerStateStore {
     });
   }
 
-  async #loadOwnerWithoutLock(): Promise<DevServerOwner | undefined> {
+  async #loadOwner(): Promise<DevelopmentServerOwner | undefined> {
     const loaded = await this.#load();
+    if (loaded.kind === "corrupt") {
+      throw this.#createCorruptStateError(loaded.cause);
+    }
+
     if (loaded.kind === "ok" && isProcessRunning(loaded.state.pid)) {
       return stateToOwner(loaded.state);
     }
@@ -242,7 +283,7 @@ export class DevServerStateStore {
   async #load(): Promise<
     | { readonly kind: "absent" }
     | { readonly kind: "corrupt"; readonly cause: unknown }
-    | { readonly kind: "ok"; readonly state: DevServerState }
+    | { readonly kind: "ok"; readonly state: PersistedDevelopmentServerState }
   > {
     let raw: string;
 
@@ -259,7 +300,7 @@ export class DevServerStateStore {
     return state.ok ? { kind: "ok", state: state.value } : { kind: "corrupt", cause: state.error };
   }
 
-  async #loadLegacyOwner(): Promise<DevServerOwner | undefined> {
+  async #loadLegacyOwner(): Promise<DevelopmentServerOwner | undefined> {
     const [processIdRaw, metadataRaw] = await Promise.all([
       readOptionalFile(this.#legacyProcessIdPath),
       readOptionalFile(this.#legacyServerPath),
@@ -305,7 +346,7 @@ export class DevServerStateStore {
   }
 
   async #writeClaimRecords(
-    state: Extract<DevServerState, { readonly kind: "starting" }>,
+    state: Extract<PersistedDevelopmentServerState, { readonly kind: "starting" }>,
   ): Promise<void> {
     let wroteLegacyProcessId = false;
 
@@ -328,7 +369,7 @@ export class DevServerStateStore {
     );
   }
 
-  async #writeAtomic(state: DevServerState): Promise<void> {
+  async #writeAtomic(state: PersistedDevelopmentServerState): Promise<void> {
     const validatedState = devServerStateSchema.parse(state);
     await this.#writeTextAtomic(this.#statePath, `${JSON.stringify(validatedState)}\n`);
   }
@@ -345,9 +386,12 @@ export class DevServerStateStore {
     }
   }
 
-  async #withLock<T>(callback: () => Promise<T>): Promise<T> {
+  async #withLock<T>(
+    callback: () => Promise<T>,
+    options: { readonly timeoutMs?: number } = {},
+  ): Promise<T> {
     await mkdir(this.#stateDir, { recursive: true });
-    const release = await acquireProcessLock(this.#lockPath);
+    const release = await acquireProcessLock(this.#lockPath, options);
 
     try {
       return await callback();
@@ -357,13 +401,13 @@ export class DevServerStateStore {
   }
 }
 
-function stateToOwner(state: DevServerState): DevServerOwner {
+function stateToOwner(state: PersistedDevelopmentServerState): DevelopmentServerOwner {
   return state.kind === "ready"
     ? { kind: "ready", pid: state.pid, url: state.url }
     : { kind: state.kind, pid: state.pid };
 }
 
-function parseDevServerState(raw: string): Result<DevServerState, unknown> {
+function parseDevServerState(raw: string): Result<PersistedDevelopmentServerState, unknown> {
   let value: unknown;
 
   try {
