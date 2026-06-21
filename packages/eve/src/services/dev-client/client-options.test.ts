@@ -26,9 +26,27 @@ describe("resolveDevelopmentClientOptions", () => {
   });
 
   it("skips the OIDC bearer for local hosts", () => {
-    for (const url of ["http://localhost:3000", "http://127.0.0.1:3000", "http://[::1]:3000"]) {
+    for (const url of [
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://0.0.0.0:3000",
+      "https://[::1]:3000",
+    ]) {
       expect(isLocalDevelopmentServerUrl(url)).toBe(true);
       expect(resolveDevelopmentClientOptions(url).auth).toBeUndefined();
+    }
+  });
+
+  it("treats non-HTTP and broader loopback targets as remote", () => {
+    for (const url of [
+      "ftp://localhost/x",
+      "ws://localhost:3000",
+      "http://127.1.2.3:3000",
+      "http://app.localhost",
+      "https://example.com",
+      "not-a-url",
+    ]) {
+      expect(isLocalDevelopmentServerUrl(url), url).toBe(false);
     }
   });
 

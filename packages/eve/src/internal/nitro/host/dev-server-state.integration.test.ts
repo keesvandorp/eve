@@ -1,7 +1,6 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -14,7 +13,7 @@ import type { Result } from "#shared/result.js";
 
 const DEAD_PID = 2_147_483_646;
 const STATE_FILE_NAME = "dev-server-state.v1.json";
-const LOCK_FILE_NAME = "dev-server-state.lock.sqlite";
+const LOCK_DIRECTORY_NAME = "dev-server-state.lock";
 
 describe("DevelopmentServerState", () => {
   let appRoot: string;
@@ -174,9 +173,8 @@ describe("DevelopmentServerState", () => {
   });
 
   it("waits for the process-safe lock instead of taking over a live holder", async () => {
-    await mkdir(join(appRoot, ".eve"), { recursive: true });
-    const blocker = new DatabaseSync(join(appRoot, ".eve", LOCK_FILE_NAME), { timeout: 0 });
-    blocker.exec("BEGIN IMMEDIATE");
+    const lockPath = join(appRoot, ".eve", LOCK_DIRECTORY_NAME);
+    await mkdir(lockPath, { recursive: true });
     let claimSettled = false;
     const claimPromise = store.claim().finally(() => {
       claimSettled = true;
@@ -185,10 +183,18 @@ describe("DevelopmentServerState", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(claimSettled).toBe(false);
 
-    blocker.exec("ROLLBACK");
-    blocker.close();
+    await rm(lockPath, { force: true, recursive: true });
 
     requireClaimed(await claimPromise);
+  });
+
+  it("recovers a stale lock directory", async () => {
+    const lockPath = join(appRoot, ".eve", LOCK_DIRECTORY_NAME);
+    await mkdir(lockPath, { recursive: true });
+    const staleTimestamp = new Date(Date.now() - 120_000);
+    await utimes(lockPath, staleTimestamp, staleTimestamp);
+
+    requireClaimed(await store.claim());
   });
 
   it("reclaims a record owned by a dead process", async () => {
@@ -270,6 +276,16 @@ describe("DevelopmentServerState", () => {
       },
     });
   });
+
+  it.each(["not-a-pid", "-1", "1.5", String(Number.MAX_SAFE_INTEGER + 1)])(
+    "ignores an invalid legacy process marker (%s)",
+    async (rawProcessId) => {
+      await mkdir(join(appRoot, ".eve"), { recursive: true });
+      await writeFile(join(appRoot, ".eve", "dev-process.pid"), `${rawProcessId}\n`, "utf8");
+
+      requireClaimed(await store.claim());
+    },
+  );
 
   it("ignores legacy metadata when its process marker is absent", async () => {
     await mkdir(join(appRoot, ".eve"), { recursive: true });

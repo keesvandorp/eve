@@ -28,8 +28,6 @@ const mocks = vi.hoisted(() => {
     upgrade: vi.fn(async (_req: unknown, _socket: unknown, _head: unknown) => undefined),
   };
   const files = new Map<string, string>();
-  const sqliteClose = vi.fn();
-  const sqliteExec = vi.fn();
   const nitro = {
     close: vi.fn(async () => undefined),
     options: {
@@ -136,8 +134,6 @@ const mocks = vi.hoisted(() => {
       moduleMapLoaderPath: "/tmp/eve-package/authored-module-map-loader.ts",
     })),
     startAuthoredSourceWatcher: vi.fn(async () => authoredSourceWatcher),
-    sqliteClose,
-    sqliteExec,
     writeFile: vi.fn(async (path: string, value: string) => {
       files.set(path, value);
     }),
@@ -151,13 +147,6 @@ vi.mock("node:fs/promises", () => ({
   rm: mocks.rm,
   stat: mocks.stat,
   writeFile: mocks.writeFile,
-}));
-
-vi.mock("node:sqlite", () => ({
-  DatabaseSync: class {
-    close = mocks.sqliteClose;
-    exec = mocks.sqliteExec;
-  },
 }));
 
 vi.mock("nitro/builder", () => ({

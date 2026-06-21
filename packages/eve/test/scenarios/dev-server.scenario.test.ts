@@ -1,18 +1,16 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
 
 import { describe, expect, it } from "vitest";
 
 import { EVE_HEALTH_ROUTE_PATH } from "../../src/protocol/routes.js";
-import { DevelopmentServerState } from "../../src/internal/nitro/host/dev-server-state.js";
 import { WEATHER_AGENT_DESCRIPTOR } from "../../src/internal/testing/scenario-apps/weather-agent.js";
 import {
   type ScenarioAppDescriptor,
   useScenarioApp,
 } from "../../src/internal/testing/scenario-app.js";
-import { useTemporaryDirectories } from "../../src/internal/testing/use-temporary-app-roots.js";
 import { sendDevelopmentMessage } from "../dev-client-harness/send-message.js";
 import { createDevelopmentSessionState } from "../dev-client-harness/session.js";
 
@@ -21,7 +19,6 @@ import { createDevelopmentSessionState } from "../dev-client-harness/session.js"
 process.env.EVE_TUI_UNICODE = "1";
 
 const scenarioApp = useScenarioApp();
-const createScratchDirectory = useTemporaryDirectories();
 const DEV_SERVER_SCENARIO_TIMEOUT_MS = 360_000;
 const DEV_SERVER_ATTACHMENT_PROBE_SOURCE = `import { runCli } from "./node_modules/eve/dist/src/cli/run.js";
 
@@ -327,69 +324,6 @@ async function startEveDev(appRoot: string): Promise<RunningEveDev> {
   };
 }
 
-async function crashStateLockHolder(appRoot: string): Promise<void> {
-  const stateDirectory = join(appRoot, ".eve");
-  const lockPath = join(stateDirectory, "dev-server-state.lock.sqlite");
-  await mkdir(stateDirectory, { recursive: true });
-  const child = spawn(
-    process.execPath,
-    [
-      "--input-type=module",
-      "-e",
-      `import { DatabaseSync } from "node:sqlite";
-const database = new DatabaseSync(${JSON.stringify(lockPath)}, { timeout: 0 });
-database.exec("BEGIN IMMEDIATE");
-process.stdout.write("LOCKED\\n");
-setInterval(() => {}, 1_000);`,
-    ],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-  let stderr = "";
-  let stdout = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    stdout += chunk;
-  });
-  child.stderr.on("data", (chunk: string) => {
-    stderr += chunk;
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(
-        new Error(`Timed out waiting for lock holder.\nstdout:\n${stdout}\nstderr:\n${stderr}`),
-      );
-    }, 10_000);
-    const handleOutput = () => {
-      if (!stdout.includes("LOCKED")) {
-        return;
-      }
-      clearTimeout(timeout);
-      child.stdout.off("data", handleOutput);
-      child.off("exit", handleEarlyExit);
-      resolve();
-    };
-    const handleEarlyExit = (code: number | null, signal: NodeJS.Signals | null) => {
-      clearTimeout(timeout);
-      reject(
-        new Error(
-          `Lock holder exited early (code ${String(code)}, signal ${String(signal)}).\nstdout:\n${stdout}\nstderr:\n${stderr}`,
-        ),
-      );
-    };
-
-    child.stdout.on("data", handleOutput);
-    child.once("exit", handleEarlyExit);
-  });
-
-  await new Promise<void>((resolve) => {
-    child.once("exit", () => resolve());
-    child.kill("SIGKILL");
-  });
-}
-
 async function runAttachmentProbe(
   appRoot: string,
   options: {
@@ -450,23 +384,6 @@ async function runAttachmentProbe(
 }
 
 describe("eve dev server", () => {
-  it(
-    "releases the state lock when its holder is killed",
-    async () => {
-      const appRoot = await createScratchDirectory("eve-dev-state-lock-");
-      await crashStateLockHolder(appRoot);
-      const state = new DevelopmentServerState({ appRoot });
-      const recoveredClaim = await state.claim();
-
-      expect(recoveredClaim).toMatchObject({ ok: true, value: { kind: "claimed" } });
-      if (!recoveredClaim.ok || recoveredClaim.value.kind !== "claimed") {
-        throw new Error("Expected to claim the app root after the lock-holder process crashed.");
-      }
-      await recoveredClaim.value.claim.release();
-    },
-    DEV_SERVER_SCENARIO_TIMEOUT_MS,
-  );
-
   it(
     "reconnects by app root, honors endpoint opt-outs, and completes a streamed turn",
     async () => {

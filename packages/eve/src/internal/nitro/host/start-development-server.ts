@@ -561,7 +561,7 @@ export async function startDevelopmentServer(
         }
 
         let releaseFailed = false;
-        const currentClose = (async () => {
+        closePromise = (async () => {
           if (cleanupResult === undefined) {
             const closing = await stateClaim.markClosing();
             if (!closing.ok && closing.error.kind !== "ownership-lost") {
@@ -605,11 +605,15 @@ export async function startDevelopmentServer(
             throw cleanupError;
           }
         })();
-        closePromise = currentClose;
         try {
-          await currentClose;
+          await closePromise;
         } catch (error) {
-          if ((cleanupResult === undefined || releaseFailed) && closePromise === currentClose) {
+          // Cleanup is memoized once it completes; failing before that, or
+          // failing the state release after it, leaves the server half-closed,
+          // so drop the promise to let a later close() retry. A concurrent
+          // close() joins this same promise rather than starting its own, so
+          // nothing else can be in flight to clobber here.
+          if (cleanupResult === undefined || releaseFailed) {
             closePromise = undefined;
           }
           throw error;

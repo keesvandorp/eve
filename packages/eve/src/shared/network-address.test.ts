@@ -29,6 +29,7 @@ describe("isLoopbackServerUrl", () => {
 
   it("rejects non-loopback hosts, non-http schemes, and junk", () => {
     for (const url of [
+      "ws://localhost:2000/",
       "http://evil.example/",
       "http://0.0.0.0:2000/",
       "ftp://127.0.0.1/",

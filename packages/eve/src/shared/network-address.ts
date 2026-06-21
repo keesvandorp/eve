@@ -1,5 +1,10 @@
 import { BlockList, isIP } from "node:net";
 
+import { z } from "#compiled/zod/index.js";
+
+/** HTTP(S) URL accepted as a development-server endpoint. */
+export const httpServerUrlSchema = z.url({ protocol: /^https?$/ });
+
 /**
  * Private, link-local, and otherwise reserved IP ranges that a framework-issued
  * outbound request to a caller-supplied URL must not target. This is the SSRF
@@ -61,14 +66,8 @@ export function isLoopbackHostname(hostname: string): boolean {
 
 /** Returns whether `urlText` is an HTTP(S) URL with a loopback hostname. */
 export function isLoopbackServerUrl(urlText: string): boolean {
-  try {
-    const url = new URL(urlText);
-    return (
-      (url.protocol === "http:" || url.protocol === "https:") && isLoopbackHostname(url.hostname)
-    );
-  } catch {
-    return false;
-  }
+  const parsed = httpServerUrlSchema.safeParse(urlText);
+  return parsed.success && isLoopbackHostname(new URL(parsed.data).hostname);
 }
 
 /**

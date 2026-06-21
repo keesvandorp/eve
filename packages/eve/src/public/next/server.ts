@@ -1,11 +1,10 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import {
   EVE_BASE_URL_ENV,
   resolveSharedDevelopmentServer,
-  type SharedDevelopmentServerHandle,
 } from "#internal/nitro/host/resolve-shared-development-server.js";
 import { isLoopbackHostname } from "#shared/network-address.js";
 
@@ -15,7 +14,12 @@ const SERVER_URL_CANDIDATE_PATTERN = /https?:\/\/[^\s"'<>]+/g;
 const NEXT_PHASE_PRODUCTION_BUILD = "phase-production-build";
 
 interface EveNextGlobalState {
-  readonly servers: Map<string, Promise<SharedDevelopmentServerHandle>>;
+  readonly servers: Map<string, Promise<EveProcessHandle>>;
+}
+
+interface EveProcessHandle {
+  readonly origin: string;
+  readonly process?: ChildProcess;
 }
 
 const globalStateSymbol = Symbol.for("eve.next.state");
@@ -77,7 +81,7 @@ function startServerProcess(input: {
   readonly cwd: string;
   readonly env?: Record<string, string>;
   readonly timeoutMs?: number;
-}): Promise<SharedDevelopmentServerHandle> {
+}): Promise<EveProcessHandle> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
@@ -135,9 +139,7 @@ function startServerProcess(input: {
   });
 }
 
-function installProcessShutdown(
-  handle: SharedDevelopmentServerHandle,
-): SharedDevelopmentServerHandle {
+function installProcessShutdown(handle: EveProcessHandle): EveProcessHandle {
   const childProcess = handle.process;
 
   if (childProcess === undefined) {
@@ -158,7 +160,7 @@ function installProcessShutdown(
 function startEveProductionServer(input: {
   readonly appRoot: string;
   readonly origin: string;
-}): Promise<SharedDevelopmentServerHandle> | undefined {
+}): Promise<EveProcessHandle> | undefined {
   const parsedOrigin = new URL(input.origin);
   const port = parsedOrigin.port;
   const serverEntry = join(input.appRoot, ".output", "server", "index.mjs");

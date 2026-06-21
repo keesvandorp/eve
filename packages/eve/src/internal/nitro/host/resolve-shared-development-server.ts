@@ -8,8 +8,8 @@ import {
   DevelopmentServerState,
   type DevelopmentServerObservation,
 } from "#internal/nitro/host/dev-server-state.js";
+import { isLocalDevelopmentServerUrl } from "#services/dev-client/local-host.js";
 import { isEveServerHealthy } from "#shared/eve-server-health.js";
-import { isLocalDevelopmentServerUrl } from "#shared/network-address.js";
 
 export const EVE_BASE_URL_ENV = "EVE_BASE_URL";
 

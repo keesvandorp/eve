@@ -1,22 +1,28 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { z } from "#compiled/zod/index.js";
-import { acquireProcessLock } from "#shared/process-lock.js";
+import { httpServerUrlSchema } from "#shared/network-address.js";
 import { err, ok, type Result } from "#shared/result.js";
 
 const STATE_FILE_NAME = "dev-server-state.v1.json";
-const LOCK_FILE_NAME = "dev-server-state.lock.sqlite";
+const LOCK_DIRECTORY_NAME = "dev-server-state.lock";
 const LEGACY_PROCESS_ID_FILE_NAME = "dev-process.pid";
 const LEGACY_SERVER_FILE_NAME = "dev-server.json";
+const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
+const LOCK_POLL_MS = 50;
+const STALE_LOCK_MS = 60_000;
 
 const processIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const ownerTokenSchema = z.string().min(1);
-const httpServerUrlSchema = z
+const legacyProcessIdSchema = z
   .string()
-  .url()
-  .refine(isHttpServerUrl, "Expected an HTTP(S) server URL.");
+  .trim()
+  .regex(/^\d+$/)
+  .transform(Number)
+  .pipe(processIdSchema);
+const ownerTokenSchema = z.string().min(1);
 const startingDevServerStateSchema = z
   .object({
     kind: z.literal("starting"),
@@ -94,8 +100,8 @@ export function isProcessRunning(pid: number): boolean {
 }
 
 /**
- * Owns the versioned dev-server record for one app root. SQLite provides the
- * cross-process mutex; the JSON record remains the inspectable source of
+ * Owns the versioned dev-server record and short cross-process critical
+ * sections for one app root. The JSON record remains the inspectable source of
  * ownership and attachment data.
  */
 export class DevelopmentServerState {
@@ -110,7 +116,7 @@ export class DevelopmentServerState {
     this.appRoot = project.appRoot;
     this.#stateDir = join(this.appRoot, ".eve");
     this.#statePath = join(this.#stateDir, STATE_FILE_NAME);
-    this.#lockPath = join(this.#stateDir, LOCK_FILE_NAME);
+    this.#lockPath = join(this.#stateDir, LOCK_DIRECTORY_NAME);
     this.#legacyProcessIdPath = join(this.#stateDir, LEGACY_PROCESS_ID_FILE_NAME);
     this.#legacyServerPath = join(this.#stateDir, LEGACY_SERVER_FILE_NAME);
   }
@@ -390,14 +396,57 @@ export class DevelopmentServerState {
     callback: () => Promise<T>,
     options: { readonly timeoutMs?: number } = {},
   ): Promise<T> {
-    await mkdir(this.#stateDir, { recursive: true });
-    const release = await acquireProcessLock(this.#lockPath, options);
+    await this.#acquireLock(options.timeoutMs ?? LOCK_ACQUIRE_TIMEOUT_MS);
 
     try {
       return await callback();
     } finally {
-      release();
+      await rm(this.#lockPath, { force: true, recursive: true }).catch(() => {});
     }
+  }
+
+  async #acquireLock(timeoutMs: number): Promise<void> {
+    const startedAt = Date.now();
+
+    for (;;) {
+      await mkdir(this.#stateDir, { recursive: true });
+
+      try {
+        await mkdir(this.#lockPath);
+        return;
+      } catch (error) {
+        if (!isErrnoException(error, "EEXIST")) {
+          throw error;
+        }
+
+        await this.#waitForLock(startedAt, timeoutMs);
+      }
+    }
+  }
+
+  async #waitForLock(startedAt: number, timeoutMs: number): Promise<void> {
+    const info = await stat(this.#lockPath).catch((error: unknown) => {
+      if (isErrnoException(error, "ENOENT")) {
+        return undefined;
+      }
+      throw error;
+    });
+
+    if (info === undefined) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - info.mtimeMs > STALE_LOCK_MS) {
+      await rm(this.#lockPath, { force: true, recursive: true }).catch(() => {});
+      return;
+    }
+
+    if (now - startedAt > timeoutMs) {
+      throw new Error(`Timed out acquiring dev-server state lock at "${this.#lockPath}".`);
+    }
+
+    await delay(LOCK_POLL_MS);
   }
 }
 
@@ -436,13 +485,8 @@ function parseLegacyMetadata(
 }
 
 function parseLegacyProcessId(raw: string): number | undefined {
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) {
-    return undefined;
-  }
-
-  const parsed = Number(trimmed);
-  return processIdSchema.safeParse(parsed).success ? parsed : undefined;
+  const parsed = legacyProcessIdSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
 }
 
 async function readOptionalFile(path: string): Promise<string | undefined> {
@@ -453,15 +497,6 @@ async function readOptionalFile(path: string): Promise<string | undefined> {
       return undefined;
     }
     throw error;
-  }
-}
-
-function isHttpServerUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
   }
 }
 
