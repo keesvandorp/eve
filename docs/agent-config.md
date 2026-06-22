@@ -75,7 +75,8 @@ export default defineAgent({
 ```
 
 Install that package in your app. It should export a default factory or
-`createWorld()` function.
+`createWorld()` function and declare a dependency or peer dependency on
+`@workflow/world` compatible with the version used by eve.
 
 Put credentials and host-specific options in runtime environment variables read
 by the world package, not in `agent.ts`. If the installed package must stay
