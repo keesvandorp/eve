@@ -6,7 +6,6 @@ import type {
 } from "#runtime/types.js";
 import { createWorkspacePromptSection } from "#runtime/workspace/spec.js";
 import type { WorkspaceRuntimeSpec } from "#runtime/workspace/types.js";
-import { formatConnectionsSection } from "#runtime/prompt/connections.js";
 
 const PARALLEL_ACTION_INSTRUCTION =
   "Tool execution\nA single tool or subagent call runs as one serial action. If you call multiple independent tools or subagents in one response, eve treats that batch as parallel work. Only batch work that is independent and does not rely on another call in the same response.";
@@ -62,6 +61,25 @@ function createWorkspacePromptBlocks(
 
   const workspaceSection = createWorkspacePromptSection(workspaceSpec);
   return workspaceSection === undefined ? [] : [workspaceSection];
+}
+
+/** Formats the static system-prompt section for available connections. */
+function formatConnectionsSection(connections: readonly ResolvedConnectionDefinition[]): string {
+  const connectionList = connections.map(
+    (connection) => `- ${connection.connectionName}: ${connection.description}`,
+  );
+
+  return [
+    "## Connections",
+    "",
+    "You have direct access to the following external services through connected MCP servers and OpenAPI HTTP APIs.",
+    "When the user's request relates to any of these services, use them instead of web search or general knowledge.",
+    "",
+    "Available connections:",
+    ...connectionList,
+    "",
+    "Use connection_search to discover specific tools within a connection. Discovered tools become directly callable by their qualified name (e.g. linear__list_issues) in your next response.",
+  ].join("\n");
 }
 
 function createConnectionsPromptBlocks(

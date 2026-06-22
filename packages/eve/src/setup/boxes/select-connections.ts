@@ -11,7 +11,6 @@ import {
   type CustomConnectionInput,
 } from "#setup/scaffold/index.js";
 import { connectorServiceForEntry } from "#setup/scaffold/connections/catalog.js";
-import type { ConnectionSelectOption } from "#setup/cli/index.js";
 
 import { select, text, type Asker, type MultiSelectOption } from "../ask.js";
 import type { ConnectionPlan, SetupState } from "../state.js";
@@ -41,12 +40,13 @@ export interface SelectConnectionsOptions {
 /** Exported for tests: the picker rows derived from the curated catalog. */
 export function buildCatalogOptions(
   disabledReasons: Readonly<Record<string, string>>,
-): ConnectionSelectOption[] {
-  const options: ConnectionSelectOption[] = CONNECTION_CATALOG.map((entry) => {
+): MultiSelectOption<string>[] {
+  return CONNECTION_CATALOG.map((entry) => {
     const reason = disabledReasons[entry.slug];
     return reason === undefined
-      ? { value: entry.slug, label: entry.label, hint: entry.hint }
+      ? { id: entry.slug, value: entry.slug, label: entry.label, hint: entry.hint }
       : {
+          id: entry.slug,
           value: entry.slug,
           label: entry.label,
           hint: entry.hint,
@@ -54,7 +54,6 @@ export function buildCatalogOptions(
           disabledReason: reason,
         };
   });
-  return options;
 }
 
 function unknownSlugError(rawSlug: string): Error {
@@ -274,20 +273,10 @@ export function selectConnections(
       if (presets.length > 0) {
         selected = [...presets];
       } else {
-        const pickerOptions: MultiSelectOption<string>[] = buildCatalogOptions({}).map(
-          (option) => ({
-            id: String(option.value),
-            value: String(option.value),
-            label: option.label,
-            hint: option.hint,
-            disabled: option.disabled,
-            disabledReason: option.disabledReason,
-          }),
-        );
         selected = await options.asker.askMany<string>({
           key: "connection",
           message: "What should your agent connect to?",
-          options: pickerOptions,
+          options: buildCatalogOptions({}),
         });
       }
 

@@ -1,4 +1,3 @@
-export { type ConnectionSelectOption } from "./connection-add-prompter.js";
 export {
   type ChannelSetupAction,
   type ChannelSetupAwaitChoice,

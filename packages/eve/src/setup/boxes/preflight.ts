@@ -1,6 +1,9 @@
-import { fetchGatewayModelIds } from "../gateway-models.js";
+import { captureVercel } from "#setup/primitives/index.js";
+
 import type { SetupState } from "../state.js";
 import type { SetupBox } from "../step.js";
+
+const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1/models";
 
 /**
  * What the gather decided to validate. `model: null` means nothing to
@@ -27,6 +30,25 @@ export interface PreflightOptions {
    */
   headless?: boolean;
   deps?: PreflightDeps;
+}
+
+/**
+ * Fetches the AI Gateway model ids through the Vercel CLI. A catalog failure
+ * is advisory: headless setup must not fail just because the model list cannot
+ * be reached.
+ */
+async function fetchGatewayModelIds(cwd: string): Promise<Set<string> | null> {
+  const result = await captureVercel(["curl", AI_GATEWAY_MODELS_URL, "--", "--silent"], { cwd });
+  if (!result.ok) return null;
+  try {
+    const json = JSON.parse(result.stdout) as { data?: { id?: unknown }[] };
+    if (!Array.isArray(json.data)) return null;
+    return new Set(
+      json.data.map((model) => model.id).filter((id): id is string => typeof id === "string"),
+    );
+  } catch {
+    return null;
+  }
 }
 
 /**
