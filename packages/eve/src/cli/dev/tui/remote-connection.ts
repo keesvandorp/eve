@@ -33,8 +33,11 @@ function challengeFor(state: RemoteConnectionState): RemoteAuthChallenge {
       return state.challenge;
     case "checking":
     case "ready":
-    case "unavailable":
       return { kind: "eve-oidc" };
+    case "unavailable":
+      return state.failure.code === "TRUSTED_SOURCES_ENVIRONMENT_MISMATCH"
+        ? { kind: "vercel-deployment-protection" }
+        : { kind: "eve-oidc" };
   }
 }
 
@@ -115,6 +118,7 @@ export function createRemoteConnectionController(
       restoreActiveCredentials = restoreCredentials;
       const probe = await probeRemoteInfo({
         client: options.client,
+        phase: "connection-check",
         signal: operation.signal,
         timeoutMs: options.probeTimeoutMs,
       });
@@ -175,6 +179,7 @@ export function createRemoteConnectionController(
       }
       const verified = await probeRemoteInfo({
         client: options.client,
+        phase: "authentication-verification",
         signal: operation.signal,
         timeoutMs: options.probeTimeoutMs,
       });
@@ -220,7 +225,7 @@ export function createRemoteConnectionController(
     reportFailure(error: unknown): RemoteConnectionState {
       operationAbort?.abort();
       operationGeneration += 1;
-      return update(classifyRemoteError(error));
+      return update(classifyRemoteError(error, "connection-check"));
     },
 
     dispose(): void {

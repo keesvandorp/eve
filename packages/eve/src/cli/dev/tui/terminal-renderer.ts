@@ -27,7 +27,12 @@ import {
   typeaheadFor,
   type CommandTypeaheadState,
 } from "./command-typeahead.js";
-import { isPromptControlCommand, parsePromptCommand, PROMPT_COMMANDS } from "./prompt-commands.js";
+import {
+  isPromptControlCommand,
+  parsePromptCommand,
+  PROMPT_COMMANDS,
+  type PromptCommandSpec,
+} from "./prompt-commands.js";
 import {
   renderFlowPanel,
   renderAcknowledgeQuestion,
@@ -97,6 +102,7 @@ import {
   stripTerminalControls,
 } from "./terminal-text.js";
 import type { VercelStatusSnapshot } from "./vercel-status.js";
+import type { RemoteConnectionSnapshot } from "./remote-connection.js";
 import { summarizeToolArgs, summarizeToolResult } from "./tool-format.js";
 import { reduceSetupSelectInput, setupSelectionIntent } from "./setup-selection-input.js";
 import {
@@ -193,6 +199,7 @@ type SetupFlowState = {
  * a `vercel deploy` build error) survives the settle.
  */
 const FLOW_OUTPUT_BUFFER_CAP = 40;
+const STATUS_LINE_LEFT_PADDING = "  ";
 
 const defaultAssistantResponseStats: AssistantResponseStatsMode = "tokensPerSecond";
 
@@ -209,6 +216,8 @@ export type TerminalRendererOptions = {
   logs?: LogDisplayMode;
   color?: boolean;
   unicode?: boolean;
+  /** Slash commands available in this local or remote session. */
+  availablePromptCommands?: readonly PromptCommandSpec[];
 };
 
 export type AgentHeaderOptions = {
@@ -276,6 +285,7 @@ export class TerminalRenderer implements AgentTUIRenderer {
   readonly #assistantResponseStats: AssistantResponseStatsMode;
   readonly #defaultContextSize?: number;
   readonly #captureForeignOutput: boolean;
+  readonly #availablePromptCommands: readonly PromptCommandSpec[];
   /** Which captured log sources render. Mutable via {@link setLogDisplayMode}. */
   #logs: LogDisplayMode;
 
@@ -318,6 +328,8 @@ export class TerminalRenderer implements AgentTUIRenderer {
   #connectionAuthPendingCount = 0;
   /** Vercel segment of the bottom status line; pushed by the runner. */
   #vercelStatus?: VercelStatusSnapshot;
+  /** Remote target and connection/authentication state; pushed by the runner. */
+  #remoteConnection?: RemoteConnectionSnapshot;
   #inputText = "";
   #inputCursor = 0;
   readonly #promptHistory = new PromptHistory();
@@ -418,6 +430,7 @@ export class TerminalRenderer implements AgentTUIRenderer {
     this.#contextSize = options?.contextSize;
     this.#captureForeignOutput = options?.captureForeignOutput ?? this.#output === process.stdout;
     this.#logs = options?.logs ?? "none";
+    this.#availablePromptCommands = options?.availablePromptCommands ?? PROMPT_COMMANDS;
   }
 
   /**
@@ -459,7 +472,7 @@ export class TerminalRenderer implements AgentTUIRenderer {
     let editor: LineState = lineOf(stripPromptControlCharacters(options?.initialDraft ?? ""));
     this.#promptHistory.begin(editor.text);
     this.#syncInput(editor);
-    this.#typeahead = typeaheadFor(PROMPT_COMMANDS, editor.text);
+    this.#typeahead = typeaheadFor(this.#availablePromptCommands, editor.text);
     this.#startCaretBlink();
     this.#paint();
 
@@ -468,7 +481,7 @@ export class TerminalRenderer implements AgentTUIRenderer {
         editor = next;
         this.#showCaret();
         this.#syncInput(editor);
-        this.#typeahead = typeaheadFor(PROMPT_COMMANDS, next.text, this.#typeahead);
+        this.#typeahead = typeaheadFor(this.#availablePromptCommands, next.text, this.#typeahead);
         this.#paint();
       };
       const recall = (entry: string | undefined) => {
@@ -1024,6 +1037,11 @@ export class TerminalRenderer implements AgentTUIRenderer {
     this.#paint();
   }
 
+  setRemoteConnectionStatus(status: RemoteConnectionSnapshot): void {
+    this.#remoteConnection = status;
+    this.#paint();
+  }
+
   reset(): void {
     this.#blocks = [];
     this.#blockById.clear();
@@ -1103,6 +1121,21 @@ export class TerminalRenderer implements AgentTUIRenderer {
   #clearSetupAttention(): void {
     if (this.#setupAttention === undefined) return;
     this.#setupAttention = undefined;
+    this.#paint();
+  }
+
+  /** Commits a slash-command invocation that was started without prompt input. */
+  renderCommandInvocation(text: string, status?: "failed"): void {
+    const content = stripTerminalControls(text);
+    if (content.trim().length === 0) return;
+    this.#start();
+    const block: Block = {
+      kind: "command",
+      body: content,
+      live: false,
+    };
+    if (status === "failed") block.status = "error";
+    this.#pushBlock(block);
     this.#paint();
   }
 
@@ -2554,6 +2587,7 @@ export class TerminalRenderer implements AgentTUIRenderer {
         content,
       };
       rows.push(...renderFlowPanel(state, this.#theme, width));
+      this.#pushRemoteStatusLine(rows, width);
       return rows;
     }
 
@@ -2638,7 +2672,12 @@ export class TerminalRenderer implements AgentTUIRenderer {
    * pending deploy) when any segment has content.
    */
   #pushStatusLine(rows: string[], width: number): void {
-    const input: Parameters<typeof buildStatusLine>[0] = { theme: this.#theme, width };
+    const padding = this.#remoteConnection === undefined ? "" : STATUS_LINE_LEFT_PADDING;
+    const contentWidth = Math.max(1, width - padding.length);
+    const input: Parameters<typeof buildStatusLine>[0] = {
+      theme: this.#theme,
+      width: contentWidth,
+    };
     if (this.#logLevelHintActive) input.logLevel = this.#logs;
     const model = this.#agentHeader?.info?.agent.model.id;
     if (model !== undefined) input.model = model;
@@ -2657,8 +2696,22 @@ export class TerminalRenderer implements AgentTUIRenderer {
       input.tokens = formatTokenFlow(flow, this.#theme.glyph);
     }
     if (this.#vercelStatus !== undefined) input.vercel = this.#vercelStatus;
+    if (this.#remoteConnection !== undefined) input.remote = this.#remoteConnection;
     const line = buildStatusLine(input);
-    if (line !== undefined) rows.push(line);
+    if (line !== undefined) rows.push(clip(`${padding}${line}`, width));
+  }
+
+  #pushRemoteStatusLine(rows: string[], width: number): void {
+    if (this.#remoteConnection === undefined) return;
+    const contentWidth = Math.max(1, width - STATUS_LINE_LEFT_PADDING.length);
+    const line = buildStatusLine({
+      remote: this.#remoteConnection,
+      theme: this.#theme,
+      width: contentWidth,
+    });
+    if (line !== undefined) {
+      rows.push("", clip(`${STATUS_LINE_LEFT_PADDING}${line}`, width));
+    }
   }
 
   #statusMeta(): string {
