@@ -1,4 +1,5 @@
 import { EVE_HEALTH_ROUTE_PATH, EVE_INFO_ROUTE_PATH } from "#protocol/routes.js";
+import { AgentInfoResultSchema } from "#client/agent-info-schema.js";
 import { ClientError } from "#client/client-error.js";
 import { ClientSession } from "#client/session.js";
 import { createInitialSessionState } from "#client/session-utils.js";
@@ -13,6 +14,7 @@ import type {
   SessionState,
   TokenValue,
 } from "#client/types.js";
+import { VERCEL_TRUSTED_OIDC_IDP_TOKEN_HEADER } from "#client/types.js";
 
 /**
  * HTTP client for talking to a deployed eve agent.
@@ -65,17 +67,24 @@ export class Client {
    *
    * @throws {ClientError} If the server returns a non-successful status.
    */
-  async info(): Promise<AgentInfoResult> {
-    const url = createClientUrl(this.#host, EVE_INFO_ROUTE_PATH);
-    const headers = await this.#resolveHeaders();
-    const response = await fetch(url, withRedirectPolicy({ headers }, this.#redirect));
+  async info(options: { readonly signal?: AbortSignal } = {}): Promise<AgentInfoResult> {
+    const request: RequestInit = {};
+    if (options.signal !== undefined) request.signal = options.signal;
+    const response = await this.fetch(EVE_INFO_ROUTE_PATH, request);
 
     if (!response.ok) {
       const body = await response.text();
       throw new ClientError(response.status, body);
     }
 
-    return (await response.json()) as AgentInfoResult;
+    const info: unknown = await response.json();
+    if (!isAgentInfoResult(info)) {
+      throw new SyntaxError(
+        "The server returned an unrecognized response from the Eve agent info route.",
+      );
+    }
+
+    return info;
   }
 
   /**
@@ -87,7 +96,10 @@ export class Client {
    */
   async fetch(path: string, init: RequestInit = {}): Promise<Response> {
     const url = createClientUrl(this.#host, path);
-    const headers = await this.#resolveHeaders(headersInitToRecord(init.headers));
+    const headers = await raceWithAbort(
+      this.#resolveHeaders(headersInitToRecord(init.headers)),
+      init.signal ?? undefined,
+    );
     return await fetch(url, withRedirectPolicy({ ...init, headers }, this.#redirect));
   }
 
@@ -116,7 +128,8 @@ export class Client {
         maxReconnectAttempts: this.#maxReconnectAttempts,
         preserveCompletedSessions: this.#preserveCompletedSessions,
         redirect: this.#redirect,
-        resolveHeaders: (perRequest) => this.#resolveHeaders(perRequest),
+        resolveHeaders: (perRequest, signal) =>
+          raceWithAbort(this.#resolveHeaders(perRequest), signal),
       },
       resolved,
     );
@@ -140,42 +153,77 @@ export class Client {
       }
     }
 
-    const authorization = await this.#resolveAuthorizationHeader();
-    if (authorization) {
-      headers.set("authorization", authorization);
-    }
+    await this.#applyAuth(headers);
 
     return headers;
   }
 
-  async #resolveAuthorizationHeader(): Promise<string | undefined> {
+  async #applyAuth(headers: Headers): Promise<void> {
     const auth = this.#auth;
-    if (!auth) return undefined;
+    if (!auth) return;
+
+    if ("vercelOidc" in auth) {
+      // One credential, two headers: the bearer the route reads and the
+      // trusted-OIDC header Vercel Deployment Protection accepts. Resolved
+      // once; the client-side mirror of the server `vercelOidc()` channel.
+      const token = (await resolveTokenValue(auth.vercelOidc.token)).trim();
+      if (token.length === 0) return;
+      headers.set("authorization", `Bearer ${token}`);
+      headers.set(VERCEL_TRUSTED_OIDC_IDP_TOKEN_HEADER, token);
+      return;
+    }
 
     if ("bearer" in auth) {
+      // Skip the header entirely on an empty token rather than emitting a
+      // malformed `Bearer ` value the server has to reject. The dev client's
+      // OIDC resolver returns "" when no token is available locally; the
+      // request then goes out unauthenticated and the framework's
+      // `vercelOidc()` channel handler returns a clean 401.
       const token = (await resolveTokenValue(auth.bearer)).trim();
-      // Skip the header entirely on an empty token rather than emitting
-      // a malformed `Bearer ` value the server has to reject. The dev
-      // client's OIDC resolver returns an empty string when no Vercel
-      // OIDC token is available locally; in that case the request goes
-      // out unauthenticated and the framework's `vercelOidc()` channel
-      // handler returns a clean 401.
-      if (token.length === 0) return undefined;
-      return `Bearer ${token}`;
+      if (token.length === 0) return;
+      headers.set("authorization", `Bearer ${token}`);
+      return;
     }
 
     if ("basic" in auth) {
       const password = await resolveTokenValue(auth.basic.password);
-      return `Basic ${encodeBasicCredentials(auth.basic.username, password)}`;
+      headers.set(
+        "authorization",
+        `Basic ${encodeBasicCredentials(auth.basic.username, password)}`,
+      );
     }
-
-    return undefined;
   }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function isAgentInfoResult(value: unknown): value is AgentInfoResult {
+  return AgentInfoResultSchema.safeParse(value).success;
+}
+
+async function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return await promise;
+  signal.throwIfAborted();
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 async function resolveTokenValue(value: TokenValue): Promise<string> {
   return typeof value === "function" ? value() : value;

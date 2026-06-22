@@ -31,7 +31,10 @@ interface SessionContext {
   readonly maxReconnectAttempts: number;
   readonly preserveCompletedSessions: boolean;
   readonly redirect?: ClientRedirectPolicy;
-  resolveHeaders(perRequest?: Readonly<Record<string, string>>): Promise<Headers>;
+  resolveHeaders(
+    perRequest?: Readonly<Record<string, string>>,
+    signal?: AbortSignal,
+  ): Promise<Headers>;
 }
 
 /**
@@ -111,7 +114,7 @@ export class ClientSession {
       ? createEveContinueSessionRoutePath(session.sessionId)
       : EVE_CREATE_SESSION_ROUTE_PATH;
     const url = createClientUrl(this.#context.host, routePath);
-    const headers = await this.#context.resolveHeaders(input.headers);
+    const headers = await this.#context.resolveHeaders(input.headers, input.signal);
     headers.set("content-type", "application/json");
 
     const body = createHandleMessageBody({
@@ -228,7 +231,7 @@ export class ClientSession {
   ): Promise<ReadableStream<Uint8Array>> {
     return await openStreamBody({
       host: this.#context.host,
-      resolveHeaders: () => this.#context.resolveHeaders(headers),
+      resolveHeaders: () => this.#context.resolveHeaders(headers, signal),
       redirect: this.#context.redirect,
       sessionId,
       signal,
@@ -248,7 +251,7 @@ export class ClientSession {
       for await (const event of openStreamIterable({
         host: this.#context.host,
         maxReconnectAttempts: this.#context.maxReconnectAttempts,
-        resolveHeaders: () => this.#context.resolveHeaders(),
+        resolveHeaders: () => this.#context.resolveHeaders(undefined, options?.signal),
         redirect: this.#context.redirect,
         sessionId,
         signal: options?.signal,
