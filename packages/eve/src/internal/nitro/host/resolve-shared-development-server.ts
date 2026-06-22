@@ -32,6 +32,7 @@ type ChildProcessOutcome =
     };
 
 interface DevelopmentServerCandidate {
+  lostElection: boolean;
   readonly process: ChildProcess;
   settled: Promise<void>;
   outcome: ChildProcessOutcome | undefined;
@@ -52,7 +53,7 @@ export async function resolveSharedDevelopmentServer(input: {
   readonly timeoutMs: number;
 }): Promise<SharedDevelopmentServerHandle> {
   const deadline = Date.now() + input.timeoutMs;
-  const project = await waitWithinDeadline(resolveDiscoveryProject(input.appRoot), deadline, () =>
+  const project = await withDeadline(resolveDiscoveryProject(input.appRoot), deadline, () =>
     createResolutionTimeout({
       appRoot: input.appRoot,
       candidate: undefined,
@@ -63,11 +64,10 @@ export async function resolveSharedDevelopmentServer(input: {
   const state = new DevelopmentServerState(project);
   let candidate: DevelopmentServerCandidate | undefined;
   let observation: DevelopmentServerObservation = { kind: "vacant" };
-  let observedCompetingOwner = false;
 
   try {
     for (;;) {
-      assertBeforeDeadline({
+      throwIfDeadlineReached({
         appRoot: project.appRoot,
         candidate,
         observation,
@@ -75,7 +75,7 @@ export async function resolveSharedDevelopmentServer(input: {
         deadline,
       });
 
-      const inspected = await waitWithinDeadline(
+      const inspected = await withDeadline(
         state.inspect({ timeoutMs: remainingTime(deadline) }),
         deadline,
         () =>
@@ -92,7 +92,7 @@ export async function resolveSharedDevelopmentServer(input: {
         });
       }
       observation = inspected.value;
-      assertBeforeDeadline({
+      throwIfDeadlineReached({
         appRoot: project.appRoot,
         candidate,
         observation,
@@ -101,67 +101,77 @@ export async function resolveSharedDevelopmentServer(input: {
       });
 
       if (
-        observation.kind !== "vacant" &&
         candidate !== undefined &&
+        observation.kind !== "vacant" &&
         observation.pid !== candidate.process.pid
       ) {
-        observedCompetingOwner = true;
+        candidate.lostElection = true;
       }
 
+      if (
+        observation.kind === "vacant" &&
+        candidate?.outcome !== undefined &&
+        !candidate.lostElection
+      ) {
+        throw createCandidateFailure(candidate, project.appRoot);
+      }
+      if (observation.kind === "vacant" && candidate?.outcome !== undefined) {
+        candidate = undefined;
+      }
       if (observation.kind === "vacant") {
-        if (candidate?.outcome !== undefined) {
-          if (!observedCompetingOwner) {
-            throw createCandidateFailure(candidate, project.appRoot);
-          }
-          candidate = undefined;
-          observedCompetingOwner = false;
-        }
         candidate ??= spawnDevelopmentServerCandidate(project.appRoot);
-      } else if (observation.kind === "ready") {
-        if (!isLocalDevelopmentServerUrl(observation.url)) {
-          throw new Error(
-            `Development server ${observation.pid} for "${project.appRoot}" published a non-local URL (${observation.url}); refusing to attach.`,
-          );
-        }
+        await waitForStateChange(candidate, deadline);
+        continue;
+      }
+      if (observation.kind !== "ready") {
+        await waitForStateChange(candidate, deadline);
+        continue;
+      }
 
-        const remainingMs = remainingTime(deadline);
-        const healthy = await waitWithinDeadline(
-          isEveServerHealthy(observation.url, {
-            timeoutMs: Math.min(remainingMs, 1_000),
-          }),
-          deadline,
-          () =>
-            createResolutionTimeout({
-              appRoot: project.appRoot,
-              candidate,
-              observation,
-              timeoutMs: input.timeoutMs,
-            }),
+      if (!isLocalDevelopmentServerUrl(observation.url)) {
+        throw new Error(
+          `Development server ${observation.pid} for "${project.appRoot}" published a non-local URL (${observation.url}); refusing to attach.`,
         );
-        if (healthy) {
-          assertBeforeDeadline({
+      }
+
+      const remainingMs = remainingTime(deadline);
+      const healthy = await withDeadline(
+        isEveServerHealthy(observation.url, {
+          timeoutMs: Math.min(remainingMs, 1_000),
+        }),
+        deadline,
+        () =>
+          createResolutionTimeout({
             appRoot: project.appRoot,
             candidate,
             observation,
             timeoutMs: input.timeoutMs,
-            deadline,
-          });
-          const ownsCandidate = candidate?.process.pid === observation.pid;
-          if (ownsCandidate && candidate?.outcome !== undefined) {
-            await waitForStateChange(candidate, deadline);
-            continue;
-          }
-          if (candidate !== undefined && !ownsCandidate) {
-            await terminateCandidate(candidate);
-          }
-
-          return ownsCandidate && candidate !== undefined
-            ? createOwnedDevelopmentServerHandle(observation.url, candidate)
-            : { origin: observation.url };
-        }
+          }),
+      );
+      if (!healthy) {
+        await waitForStateChange(candidate, deadline);
+        continue;
       }
 
-      await waitForStateChange(candidate, deadline);
+      throwIfDeadlineReached({
+        appRoot: project.appRoot,
+        candidate,
+        observation,
+        timeoutMs: input.timeoutMs,
+        deadline,
+      });
+      const ownsCandidate = candidate?.process.pid === observation.pid;
+      if (ownsCandidate && candidate?.outcome !== undefined) {
+        await waitForStateChange(candidate, deadline);
+        continue;
+      }
+      if (candidate !== undefined && !ownsCandidate) {
+        await terminateCandidate(candidate);
+      }
+
+      return ownsCandidate && candidate !== undefined
+        ? createOwnedDevelopmentServerHandle(observation.url, candidate)
+        : { origin: observation.url };
     }
   } catch (error) {
     if (candidate !== undefined) {
@@ -189,6 +199,7 @@ function spawnDevelopmentServerCandidate(appRoot: string): DevelopmentServerCand
     },
   );
   const candidate: DevelopmentServerCandidate = {
+    lostElection: false,
     outcome: undefined,
     process: child,
     settled: Promise.resolve(),
@@ -239,7 +250,7 @@ function remainingTime(deadline: number): number {
   return Math.max(0, deadline - Date.now());
 }
 
-function assertBeforeDeadline(input: {
+function throwIfDeadlineReached(input: {
   readonly appRoot: string;
   readonly candidate: DevelopmentServerCandidate | undefined;
   readonly deadline: number;
@@ -274,7 +285,7 @@ function createResolutionTimeout(input: {
   );
 }
 
-async function waitWithinDeadline<T>(
+async function withDeadline<T>(
   operation: Promise<T>,
   deadline: number,
   createTimeoutError: () => Error,

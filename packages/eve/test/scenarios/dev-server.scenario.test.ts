@@ -37,7 +37,10 @@ try {
     },
     {
       runDevelopmentTui: async (input) => {
-        attachment = { appRoot: input.appRoot, serverUrl: input.serverUrl };
+        attachment = {
+          appRoot: input.target.kind === "local" ? input.target.workspaceRoot : undefined,
+          serverUrl: input.target.serverUrl,
+        };
       },
     },
   );
@@ -52,6 +55,10 @@ process.stdout.write(\`EVE_ATTACHMENT_PROBE \${JSON.stringify(outcome)}\\n\`, ()
 `;
 const DEV_SERVER_AGENT_DESCRIPTOR: ScenarioAppDescriptor = {
   ...WEATHER_AGENT_DESCRIPTOR,
+  dependencies: {
+    ...WEATHER_AGENT_DESCRIPTOR.dependencies,
+    microsandbox: "0.5.5",
+  },
   files: {
     ...Object.fromEntries(
       Object.entries(WEATHER_AGENT_DESCRIPTOR.files).filter(

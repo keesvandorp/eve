@@ -191,9 +191,12 @@ describe("eve dev local server ownership", () => {
     });
     expect(runDevelopmentTui).toHaveBeenCalledWith(
       expect.objectContaining({
-        appRoot: "/canonical/app",
         name: "App",
-        serverUrl: "http://127.0.0.1:4321/",
+        target: {
+          kind: "local",
+          serverUrl: "http://127.0.0.1:4321/",
+          workspaceRoot: "/canonical/app",
+        },
       }),
     );
   });

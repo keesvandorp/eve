@@ -1,8 +1,47 @@
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const filesystemTestHooks = vi.hoisted(() => {
+  return {
+    afterRename: async (
+      _source: unknown,
+      _destination: unknown,
+      _error: unknown,
+    ): Promise<void> => {},
+    beforeRemove: async (_path: unknown): Promise<void> => {},
+    beforeRename: async (_source: unknown, _destination: unknown): Promise<void> => {},
+    reset() {
+      this.afterRename = async () => {};
+      this.beforeRemove = async () => {};
+      this.beforeRename = async () => {};
+    },
+  };
+});
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      await filesystemTestHooks.beforeRename(args[0], args[1]);
+      try {
+        const result = await actual.rename(...args);
+        await filesystemTestHooks.afterRename(args[0], args[1], undefined);
+        return result;
+      } catch (error) {
+        await filesystemTestHooks.afterRename(args[0], args[1], error);
+        throw error;
+      }
+    },
+    rm: async (...args: Parameters<typeof actual.rm>) => {
+      await filesystemTestHooks.beforeRemove(args[0]);
+      return await actual.rm(...args);
+    },
+  };
+});
 
 import {
   type DevelopmentServerClaim,
@@ -25,6 +64,7 @@ describe("DevelopmentServerState", () => {
   });
 
   afterEach(async () => {
+    filesystemTestHooks.reset();
     vi.unstubAllGlobals();
     await rm(appRoot, { force: true, recursive: true });
   });
@@ -172,29 +212,152 @@ describe("DevelopmentServerState", () => {
     expect(await readRawRecord()).toMatchObject({ ownerToken: expect.any(String) });
   });
 
-  it("waits for the process-safe lock instead of taking over a live holder", async () => {
+  it("waits instead of retiring a lock owned by a live process", async () => {
     const lockPath = join(appRoot, ".eve", LOCK_DIRECTORY_NAME);
     await mkdir(lockPath, { recursive: true });
-    let claimSettled = false;
-    const claimPromise = store.claim().finally(() => {
-      claimSettled = true;
+    await writeFile(
+      join(lockPath, "owner.json"),
+      `${JSON.stringify({ pid: process.pid, token: "live-generation" })}\n`,
+      "utf8",
+    );
+    let settled = false;
+    const claim = store.claim().finally(() => {
+      settled = true;
     });
 
     await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(claimSettled).toBe(false);
+    expect(settled).toBe(false);
 
     await rm(lockPath, { force: true, recursive: true });
-
-    requireClaimed(await claimPromise);
+    requireClaimed(await claim);
   });
 
-  it("recovers a stale lock directory", async () => {
+  it("does not let a delayed stale-lock recoverer remove a replacement generation", async () => {
     const lockPath = join(appRoot, ".eve", LOCK_DIRECTORY_NAME);
     await mkdir(lockPath, { recursive: true });
-    const staleTimestamp = new Date(Date.now() - 120_000);
-    await utimes(lockPath, staleTimestamp, staleTimestamp);
+    await writeFile(
+      join(lockPath, "owner.json"),
+      `${JSON.stringify({ pid: DEAD_PID, token: "dead-generation" })}\n`,
+      "utf8",
+    );
+    const replacementInstalled = Promise.withResolvers<void>();
+    const secondRetirementStarted = Promise.withResolvers<void>();
+    let retirementAttempts = 0;
+    let delayedRetirementRejected = false;
+    filesystemTestHooks.beforeRename = async (source, destination) => {
+      if (
+        source !== lockPath ||
+        typeof destination !== "string" ||
+        !destination.startsWith(`${lockPath}.retired.`)
+      ) {
+        return;
+      }
+
+      retirementAttempts += 1;
+      if (retirementAttempts === 1) {
+        await secondRetirementStarted.promise;
+      } else {
+        secondRetirementStarted.resolve();
+        await replacementInstalled.promise;
+      }
+    };
+    filesystemTestHooks.afterRename = async (source, destination, error) => {
+      if (
+        error === undefined &&
+        typeof source === "string" &&
+        source.startsWith(`${lockPath}.pending.`) &&
+        destination === lockPath &&
+        retirementAttempts === 2
+      ) {
+        replacementInstalled.resolve();
+      }
+      if (
+        error !== undefined &&
+        source === lockPath &&
+        typeof destination === "string" &&
+        destination.startsWith(`${lockPath}.retired.`)
+      ) {
+        delayedRetirementRejected = true;
+      }
+    };
+
+    const results = await Promise.all([
+      store.claim(),
+      new DevelopmentServerState({ appRoot }).claim(),
+    ]);
+    expect(results.filter((result) => result.ok && result.value.kind === "claimed")).toHaveLength(
+      1,
+    );
+    expect(results.filter((result) => result.ok && result.value.kind === "occupied")).toHaveLength(
+      1,
+    );
+
+    expect(delayedRetirementRejected).toBe(true);
+    expect(
+      (await readdir(join(appRoot, ".eve"))).filter((entry) =>
+        entry.startsWith(`${LOCK_DIRECTORY_NAME}.retired.`),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("retries when an incumbent releases between rename failure and observation", async () => {
+    const lockPath = join(appRoot, ".eve", LOCK_DIRECTORY_NAME);
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(
+      join(lockPath, "owner.json"),
+      `${JSON.stringify({ pid: process.pid, token: "departing-generation" })}\n`,
+      "utf8",
+    );
+    filesystemTestHooks.afterRename = async (source, destination, error) => {
+      if (
+        error !== undefined &&
+        typeof source === "string" &&
+        source.startsWith(`${lockPath}.pending.`) &&
+        destination === lockPath
+      ) {
+        await rm(lockPath, { force: true, recursive: true });
+      }
+    };
 
     requireClaimed(await store.claim());
+  });
+
+  it("reports failure to relinquish the active lock after claiming", async () => {
+    const lockPath = join(appRoot, ".eve", LOCK_DIRECTORY_NAME);
+    filesystemTestHooks.beforeRename = async (source, destination) => {
+      if (
+        source === lockPath &&
+        typeof destination === "string" &&
+        destination.startsWith(`${lockPath}.released.`)
+      ) {
+        throw new Error("Injected active development-server lock release failure.");
+      }
+    };
+
+    const claim = await store.claim();
+
+    expect(claim).toMatchObject({
+      error: {
+        cause: new Error("Injected active development-server lock release failure."),
+        kind: "io",
+      },
+      ok: false,
+    });
+  });
+
+  it("preserves a claim when detached lock cleanup fails", async () => {
+    const lockPath = join(appRoot, ".eve", LOCK_DIRECTORY_NAME);
+    filesystemTestHooks.beforeRemove = async (path) => {
+      if (typeof path === "string" && path.startsWith(`${lockPath}.released.`)) {
+        throw new Error("Injected detached development-server lock cleanup failure.");
+      }
+    };
+
+    const claim = requireClaimed(await store.claim());
+    await expect(claim.publish("http://127.0.0.1:2000/")).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
   });
 
   it("reclaims a record owned by a dead process", async () => {
@@ -329,6 +492,38 @@ describe("DevelopmentServerState", () => {
     await stateClaim.release();
     await expect(readFile(legacyProcessIdPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(legacyServerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves the versioned owner when an old server later removes compatibility files", async () => {
+    await mkdir(join(appRoot, ".eve"), { recursive: true });
+    await writeFile(join(appRoot, ".eve", "dev-process.pid"), `${DEAD_PID}\n`, "utf8");
+    await writeFile(
+      join(appRoot, ".eve", "dev-server.json"),
+      `${JSON.stringify({ pid: DEAD_PID, url: "http://127.0.0.1:1000/" })}\n`,
+      "utf8",
+    );
+    const stateClaim = requireClaimed(await store.claim());
+    await stateClaim.publish("http://127.0.0.1:2000/");
+
+    await Promise.all([
+      rm(join(appRoot, ".eve", "dev-process.pid"), { force: true }),
+      rm(join(appRoot, ".eve", "dev-server.json"), { force: true }),
+    ]);
+
+    await expect(store.inspect()).resolves.toEqual({
+      ok: true,
+      value: {
+        kind: "ready",
+        pid: process.pid,
+        url: "http://127.0.0.1:2000/",
+      },
+    });
+    await expect(readRawRecord()).resolves.toMatchObject({
+      kind: "ready",
+      ownerToken: expect.any(String),
+      pid: process.pid,
+      url: "http://127.0.0.1:2000/",
+    });
   });
 
   it("fails closed when versioned state fails its persisted schema", async () => {

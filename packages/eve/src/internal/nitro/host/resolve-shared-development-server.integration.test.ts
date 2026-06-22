@@ -104,6 +104,19 @@ describe("resolveSharedDevelopmentServer", () => {
     });
   });
 
+  it("reports a failed candidate when no competing owner claimed", async () => {
+    const appRoot = await createTempAppRoot();
+    const child = createMockChildProcess(2_147_483_646);
+    spawnMock.mockReturnValue(child);
+
+    const resolution = resolveSharedDevelopmentServer({ appRoot, timeoutMs: 2_000 });
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledOnce());
+    child.emit("exit", 1, null);
+
+    await expect(resolution).rejects.toThrow(/failed before publishing ready state \(exit code 1/u);
+    expect(spawnMock).toHaveBeenCalledOnce();
+  });
+
   it("uses the winning owner when its candidate child loses the claim", async () => {
     const appRoot = await createTempAppRoot();
     const losingChild = createMockChildProcess(2_147_483_646);
@@ -141,7 +154,7 @@ describe("resolveSharedDevelopmentServer", () => {
     await expect(resolution).resolves.toEqual({ origin: "http://127.0.0.1:49152" });
   });
 
-  it("starts a new election when a competing owner disappears", async () => {
+  it("retries when its candidate loses to an owner that later exits", async () => {
     const appRoot = await createTempAppRoot();
     const losingChild = createMockChildProcess(2_147_483_646);
     const winningChild = createMockChildProcess(process.pid);

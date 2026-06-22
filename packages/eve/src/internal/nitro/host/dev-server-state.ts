@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { z } from "#compiled/zod/index.js";
@@ -12,8 +12,8 @@ const LOCK_DIRECTORY_NAME = "dev-server-state.lock";
 const LEGACY_PROCESS_ID_FILE_NAME = "dev-process.pid";
 const LEGACY_SERVER_FILE_NAME = "dev-server.json";
 const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
+const LOCK_OWNER_FILE_NAME = "owner.json";
 const LOCK_POLL_MS = 50;
-const STALE_LOCK_MS = 60_000;
 
 const processIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const legacyProcessIdSchema = z
@@ -23,6 +23,12 @@ const legacyProcessIdSchema = z
   .transform(Number)
   .pipe(processIdSchema);
 const ownerTokenSchema = z.string().min(1);
+const developmentServerLockOwnerSchema = z
+  .object({
+    pid: processIdSchema,
+    token: ownerTokenSchema,
+  })
+  .strict();
 const startingDevServerStateSchema = z
   .object({
     kind: z.literal("starting"),
@@ -57,6 +63,7 @@ const legacyDevServerMetadataSchema = z.object({
 
 /** Persisted ownership state for one app root. */
 type PersistedDevelopmentServerState = Readonly<z.infer<typeof devServerStateSchema>>;
+type DevelopmentServerLockOwner = Readonly<z.infer<typeof developmentServerLockOwnerSchema>>;
 
 /** A live process that currently owns the app root. */
 export type DevelopmentServerOwner =
@@ -100,9 +107,34 @@ export function isProcessRunning(pid: number): boolean {
 }
 
 /**
- * Owns the versioned dev-server record and short cross-process critical
- * sections for one app root. The JSON record remains the inspectable source of
- * ownership and attachment data.
+ * Coordinates the one development server allowed to write an app root's
+ * generated `.eve` artifacts.
+ *
+ * Any process that enters `startDevelopmentServer()` is eligible to own the
+ * root. Today that includes direct `eve dev` and local `eve eval` processes,
+ * plus the `eve dev` children started by Next.js, Nuxt, or SvelteKit adapters.
+ * They can start in separate operating-system processes, so `claim()`,
+ * `publish()`, `markClosing()`, and `release()` use a filesystem lock around
+ * each read-decide-write transition. This prevents two processes from claiming
+ * the same root or an old process from overwriting its successor.
+ *
+ * The versioned JSON record is authoritative because `claim()` creates its
+ * random owner token while holding that lock, and later mutations must present
+ * the same token. Its phase, PID, and ready URL let another CLI or adapter
+ * observe the owner and attach to it instead of starting a competing server.
+ *
+ * @example
+ * ```ts
+ * const state = new DevelopmentServerState({ appRoot });
+ * const attempt = await state.claim();
+ * if (!attempt.ok) throw attempt.error.cause;
+ * if (attempt.value.kind === "claimed") {
+ *   const published = await attempt.value.claim.publish("http://127.0.0.1:3000/");
+ *   if (!published.ok) throw published.error;
+ * } else {
+ *   console.log(attempt.value.owner);
+ * }
+ * ```
  */
 export class DevelopmentServerState {
   readonly appRoot: string;
@@ -136,8 +168,10 @@ export class DevelopmentServerState {
   /** Atomically returns the live owner or records this process as a fresh starting claim. */
   async claim(): Promise<Result<DevelopmentServerClaimAttempt, DevelopmentServerStateError>> {
     const pid = process.pid;
+    let enteredCriticalSection = false;
     try {
       return await this.#withLock(async () => {
+        enteredCriticalSection = true;
         const loaded = await this.#load();
 
         if (loaded.kind === "corrupt") {
@@ -159,6 +193,9 @@ export class DevelopmentServerState {
         return ok({ kind: "claimed", claim: this.#createClaim(pid, ownerToken) });
       });
     } catch (cause) {
+      if (enteredCriticalSection) {
+        return err({ kind: "io", cause });
+      }
       const owner = await this.#loadOwner().catch(() => undefined);
       return owner === undefined ? err({ kind: "io", cause }) : ok({ kind: "occupied", owner });
     }
@@ -396,58 +433,199 @@ export class DevelopmentServerState {
     callback: () => Promise<T>,
     options: { readonly timeoutMs?: number } = {},
   ): Promise<T> {
-    await this.#acquireLock(options.timeoutMs ?? LOCK_ACQUIRE_TIMEOUT_MS);
+    const lock = new DevelopmentServerFilesystemLock(
+      this.#lockPath,
+      options.timeoutMs ?? LOCK_ACQUIRE_TIMEOUT_MS,
+    );
+    await lock.acquire();
 
     try {
       return await callback();
     } finally {
-      await rm(this.#lockPath, { force: true, recursive: true }).catch(() => {});
+      await lock.release();
     }
   }
+}
 
-  async #acquireLock(timeoutMs: number): Promise<void> {
-    const startedAt = Date.now();
+class DevelopmentServerFilesystemLock {
+  readonly #deadline: number;
+  readonly #lockPath: string;
+  readonly #owner: DevelopmentServerLockOwner = {
+    pid: process.pid,
+    token: randomUUID(),
+  };
+  readonly #stagingPath: string;
+  readonly #timeoutMs: number;
 
-    for (;;) {
-      await mkdir(this.#stateDir, { recursive: true });
+  constructor(lockPath: string, timeoutMs: number) {
+    this.#deadline = Date.now() + timeoutMs;
+    this.#lockPath = lockPath;
+    this.#stagingPath = `${lockPath}.pending.${String(process.pid)}.${this.#owner.token}`;
+    this.#timeoutMs = timeoutMs;
+  }
 
-      try {
-        await mkdir(this.#lockPath);
-        return;
-      } catch (error) {
-        if (!isErrnoException(error, "EEXIST")) {
-          throw error;
+  async acquire(): Promise<void> {
+    await this.#stageOwnerDirectory();
+    let firstAttempt = true;
+
+    try {
+      for (;;) {
+        if (!firstAttempt && Date.now() >= this.#deadline) {
+          throw this.#createTimeoutError();
+        }
+        firstAttempt = false;
+
+        try {
+          await rename(this.#stagingPath, this.#lockPath);
+          return;
+        } catch (error) {
+          if (!(await pathExists(this.#lockPath))) {
+            if (isLockContentionError(error)) {
+              continue;
+            }
+            throw error;
+          }
         }
 
-        await this.#waitForLock(startedAt, timeoutMs);
+        const observed = await readDevelopmentServerLockOwner(this.#lockPath);
+        if (observed === undefined) {
+          if (await pathExists(this.#lockPath)) {
+            await this.#waitForRetry();
+          }
+          continue;
+        }
+
+        if (!isProcessRunning(observed.pid)) {
+          await this.#retireDeadOwner(observed);
+        }
+
+        await this.#waitForRetry();
       }
+    } finally {
+      await rm(this.#stagingPath, { force: true, recursive: true }).catch(() => {});
     }
   }
 
-  async #waitForLock(startedAt: number, timeoutMs: number): Promise<void> {
-    const info = await stat(this.#lockPath).catch((error: unknown) => {
+  async release(): Promise<void> {
+    const observed = await readDevelopmentServerLockOwner(this.#lockPath);
+    if (observed === undefined) {
+      if (await pathExists(this.#lockPath)) {
+        throw new Error(`Development-server lock at "${this.#lockPath}" is malformed.`);
+      }
+      return;
+    }
+    if (!sameDevelopmentServerLockOwner(observed, this.#owner)) {
+      return;
+    }
+
+    const retiredPath = `${this.#lockPath}.released.${this.#owner.token}.${randomUUID()}`;
+    try {
+      await rename(this.#lockPath, retiredPath);
+    } catch (error) {
       if (isErrnoException(error, "ENOENT")) {
-        return undefined;
+        return;
       }
       throw error;
-    });
-
-    if (info === undefined) {
-      return;
     }
-
-    const now = Date.now();
-    if (now - info.mtimeMs > STALE_LOCK_MS) {
-      await rm(this.#lockPath, { force: true, recursive: true }).catch(() => {});
-      return;
-    }
-
-    if (now - startedAt > timeoutMs) {
-      throw new Error(`Timed out acquiring dev-server state lock at "${this.#lockPath}".`);
-    }
-
-    await delay(LOCK_POLL_MS);
+    // The rename relinquished ownership. Failure to clean the detached
+    // directory cannot invalidate the completed critical section.
+    await rm(retiredPath, { force: true, recursive: true }).catch(() => {});
   }
+
+  async #stageOwnerDirectory(): Promise<void> {
+    await mkdir(dirname(this.#lockPath), { recursive: true });
+    try {
+      await mkdir(this.#stagingPath);
+      await writeFile(
+        join(this.#stagingPath, LOCK_OWNER_FILE_NAME),
+        `${JSON.stringify(developmentServerLockOwnerSchema.parse(this.#owner))}\n`,
+        "utf8",
+      );
+    } catch (error) {
+      await rm(this.#stagingPath, { force: true, recursive: true }).catch(() => {});
+      throw error;
+    }
+  }
+
+  async #retireDeadOwner(observed: DevelopmentServerLockOwner): Promise<void> {
+    const current = await readDevelopmentServerLockOwner(this.#lockPath);
+    if (!sameDevelopmentServerLockOwner(current, observed) || isProcessRunning(observed.pid)) {
+      return;
+    }
+
+    const retiredPath = `${this.#lockPath}.retired.${hashOwnerToken(observed.token)}`;
+    try {
+      await rename(this.#lockPath, retiredPath);
+    } catch (error) {
+      if ((await pathExists(retiredPath)) || !(await pathExists(this.#lockPath))) {
+        return;
+      }
+      throw error;
+    }
+
+    // Keep this non-empty generation marker. Delayed recoverers target the
+    // same path, so they cannot rename a newer owner after the lock is reused.
+  }
+
+  async #waitForRetry(): Promise<void> {
+    const remainingMs = this.#deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw this.#createTimeoutError();
+    }
+    await delay(Math.min(LOCK_POLL_MS, remainingMs));
+  }
+
+  #createTimeoutError(): Error {
+    return new Error(
+      `Timed out after ${String(this.#timeoutMs)}ms acquiring development-server state lock at "${this.#lockPath}".`,
+    );
+  }
+}
+
+function isLockContentionError(error: unknown): boolean {
+  return isErrnoException(error, "EEXIST") || isErrnoException(error, "ENOTEMPTY");
+}
+
+function hashOwnerToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (isErrnoException(error, "ENOENT")) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function readDevelopmentServerLockOwner(
+  lockPath: string,
+): Promise<DevelopmentServerLockOwner | undefined> {
+  const raw = await readOptionalFile(join(lockPath, LOCK_OWNER_FILE_NAME));
+  if (raw === undefined) {
+    return undefined;
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+
+  const parsed = developmentServerLockOwnerSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function sameDevelopmentServerLockOwner(
+  left: DevelopmentServerLockOwner | undefined,
+  right: DevelopmentServerLockOwner,
+): boolean {
+  return left?.pid === right.pid && left.token === right.token;
 }
 
 function stateToOwner(state: PersistedDevelopmentServerState): DevelopmentServerOwner {

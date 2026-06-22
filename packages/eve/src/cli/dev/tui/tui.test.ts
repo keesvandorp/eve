@@ -16,7 +16,7 @@ vi.mock("./runner.js", () => ({
   },
 }));
 
-import { runDevelopmentTui } from "./tui.js";
+import { runDevelopmentTui, type DevelopmentTuiTarget } from "./tui.js";
 
 describe("runDevelopmentTui", () => {
   beforeEach(() => {
@@ -24,8 +24,13 @@ describe("runDevelopmentTui", () => {
   });
 
   it("creates a fresh client session for every TUI attached to the same server", async () => {
-    await runDevelopmentTui({ serverUrl: "http://127.0.0.1:4321/" });
-    await runDevelopmentTui({ serverUrl: "http://127.0.0.1:4321/" });
+    const target = {
+      kind: "local",
+      serverUrl: "http://127.0.0.1:4321/",
+      workspaceRoot: "/tmp/app",
+    } satisfies DevelopmentTuiTarget;
+    await runDevelopmentTui({ target });
+    await runDevelopmentTui({ target });
 
     expect(mocks.runnerOptions).toHaveLength(2);
     const [first, second] = mocks.runnerOptions;

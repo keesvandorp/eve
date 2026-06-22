@@ -28,6 +28,8 @@ const mocks = vi.hoisted(() => {
     upgrade: vi.fn(async (_req: unknown, _socket: unknown, _head: unknown) => undefined),
   };
   const files = new Map<string, string>();
+  const pathExists = (path: string) =>
+    files.has(path) || [...files.keys()].some((candidate) => candidate.startsWith(`${path}/`));
   const nitro = {
     close: vi.fn(async () => undefined),
     options: {
@@ -79,12 +81,28 @@ const mocks = vi.hoisted(() => {
         throw fsControl.stateRemoveError;
       }
       files.delete(path);
+      for (const candidate of files.keys()) {
+        if (candidate.startsWith(`${path}/`)) {
+          files.delete(candidate);
+        }
+      }
     }),
     rename: vi.fn(async (from: string, to: string) => {
       const value = files.get(from);
+      const directoryEntries = [...files.entries()].filter(([path]) => path.startsWith(`${from}/`));
 
       if (value === undefined) {
-        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        if (directoryEntries.length === 0) {
+          throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        }
+        if (pathExists(to)) {
+          throw Object.assign(new Error("ENOTEMPTY"), { code: "ENOTEMPTY" });
+        }
+        for (const [path, contents] of directoryEntries) {
+          files.set(`${to}${path.slice(from.length)}`, contents);
+          files.delete(path);
+        }
+        return;
       }
 
       if (
@@ -113,7 +131,7 @@ const mocks = vi.hoisted(() => {
       files.delete(from);
     }),
     stat: vi.fn(async (path: string) => {
-      if (!files.has(path)) {
+      if (!pathExists(path)) {
         throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
       }
 
